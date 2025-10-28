@@ -271,38 +271,6 @@ def perform_clustering_per_year(
     return result_df
 
 
-def process_fold(fold_idx, train_years, val_years, threshold, linkage_method, pairs_df, TO_ANALYSE_DF):
-    """
-    Process a single fold: perform clustering on validation years and calculate average correlation.
-
-    NOTE: For MST clustering, we apply threshold directly to validation years since
-    the clustering is year-specific and doesn't transfer across years.
-    """
-    # Perform clustering on validation years
-    val_cluster_df = perform_clustering_per_year(
-        TO_ANALYSE_DF=TO_ANALYSE_DF,
-        years_to_cluster=val_years,
-        threshold=threshold,
-        linkage_method=linkage_method
-    )
-
-    # Calculate average correlation for validation clusters
-    val_avg_corr_df = calculate_avg_correlation(
-        TO_ANALYSE_DF=TO_ANALYSE_DF,
-        cluster_df=val_cluster_df,
-        cluster_type=f"ValFold{fold_idx}"
-    )
-
-    # Compute the mean of average correlations for this fold
-    mean_val_corr = val_avg_corr_df[f'ValFold{fold_idx}AvgCorrelation'].mean()
-
-    # Handle cases where mean_val_corr is NaN
-    if np.isnan(mean_val_corr):
-        mean_val_corr = -np.inf  # Assign worst possible score
-
-    return mean_val_corr
-
-
 def optimise_cluster_parameters(TO_ANALYSE_DF, pairs_df, use_holdout=True):
     """
     Optimize clustering parameters using Optuna with temporal cross-validation.
@@ -341,52 +309,84 @@ def optimise_cluster_parameters(TO_ANALYSE_DF, pairs_df, use_holdout=True):
         # Use all data (original behavior)
         optimization_df = pairs_df
         optimization_years = all_years
+        years_A = None
+        years_B = None
+        years_C = None
 
     def objective(trial):
         # Suggest values for hyperparameters
         threshold = trial.suggest_float('threshold', -3.53, -3.3, step=0.002)
         linkage_method = 'single'
 
-        # Define temporal cross-validation folds within optimization data
-        unique_years_sorted = sorted(optimization_df['year'].unique())
-        n_years = len(unique_years_sorted)
-
-        # Define two temporal splits
-        fold1_train_years = unique_years_sorted[:n_years//2]
-        fold1_val_years = unique_years_sorted[n_years//2:]
-
-        fold2_train_years = unique_years_sorted[:(3*n_years)//4]
-        fold2_val_years = unique_years_sorted[(3*n_years)//4:]
-
-        folds = [
-            (fold1_train_years, fold1_val_years),
-            (fold2_train_years, fold2_val_years)
-        ]
-
-        # Prepare arguments for parallel processing
-        tasks = [
-            (idx+1, train, val, threshold, linkage_method, optimization_df, optimization_df)
-            for idx, (train, val) in enumerate(folds)
-        ]
-
-        # Execute folds in parallel
-        fold_results = Parallel(n_jobs=-1)(
-            delayed(process_fold)(fold_idx, train_years, val_years, threshold, linkage_method, pairs_df, TO_ANALYSE_DF)
-            for (fold_idx, train_years, val_years, threshold, linkage_method, pairs_df, TO_ANALYSE_DF) in tasks
-        )
-
-        # Aggregate the average correlations across folds (mean)
-        overall_avg_corr = np.mean(fold_results)
-
-        # Log the parameters and the resulting correlation
-        logging.info(f"Threshold: {threshold}, Linkage Method: {linkage_method}, Average Correlation: {overall_avg_corr}")
+        if use_holdout:
+            # Simple evaluation on Period A and Period B separately
+            
+            # Evaluate on Period A (25% of total data)
+            period_A_df = optimization_df[optimization_df['year'].isin(years_A)]
+            cluster_df_A = perform_clustering_per_year(
+                TO_ANALYSE_DF=period_A_df,
+                years_to_cluster=years_A,
+                threshold=threshold,
+                linkage_method=linkage_method
+            )
+            avg_corr_A = calculate_avg_correlation(
+                TO_ANALYSE_DF=period_A_df,
+                cluster_df=cluster_df_A,
+                cluster_type="PeriodA"
+            )
+            score_A = avg_corr_A['PeriodAAvgCorrelation'].mean()
+            
+            # Evaluate on Period B (50% of total data)  
+            period_B_df = optimization_df[optimization_df['year'].isin(years_B)]
+            cluster_df_B = perform_clustering_per_year(
+                TO_ANALYSE_DF=period_B_df,
+                years_to_cluster=years_B,
+                threshold=threshold,
+                linkage_method=linkage_method
+            )
+            avg_corr_B = calculate_avg_correlation(
+                TO_ANALYSE_DF=period_B_df,
+                cluster_df=cluster_df_B,
+                cluster_type="PeriodB"
+            )
+            score_B = avg_corr_B['PeriodBAvgCorrelation'].mean()
+            
+            # Average across both periods (as stated in paper)
+            overall_avg_corr = (score_A + score_B) / 2
+            
+            # Handle NaN cases
+            if np.isnan(overall_avg_corr):
+                overall_avg_corr = -np.inf
+                
+            # Log the parameters and the resulting correlation
+            logging.info(f"Threshold: {threshold}, Score A: {score_A:.4f}, Score B: {score_B:.4f}, Average: {overall_avg_corr:.4f}")
+            
+        else:
+            # Original behavior - evaluate on all optimization data
+            cluster_df = perform_clustering_per_year(
+                TO_ANALYSE_DF=optimization_df,
+                years_to_cluster=optimization_years,
+                threshold=threshold,
+                linkage_method=linkage_method
+            )
+            avg_corr_df = calculate_avg_correlation(
+                TO_ANALYSE_DF=optimization_df,
+                cluster_df=cluster_df,
+                cluster_type="All"
+            )
+            overall_avg_corr = avg_corr_df['AllAvgCorrelation'].mean()
+            
+            if np.isnan(overall_avg_corr):
+                overall_avg_corr = -np.inf
+                
+            logging.info(f"Threshold: {threshold}, Average Correlation: {overall_avg_corr:.4f}")
 
         return overall_avg_corr  # Optuna will maximize this
 
     # Create an Optuna study
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=1))
 
-    # Optimize the study with temporal cross-validation and parallel processing
+    # Optimize the study with temporal cross-validation
     study.optimize(objective, n_trials=150, timeout=28800, callbacks=[save_study_callback])
 
     # Retrieve the best parameters
