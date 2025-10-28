@@ -39,6 +39,8 @@ from tqdm import tqdm
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+import warnings
+import optuna
 from functools import partial
 from joblib import Parallel, delayed
 import logging
@@ -289,15 +291,23 @@ print(f"sic: {sic_p}, industry: {ind_p}, population: {pop_p}")
 pairs_df['cosine_distance'] = 1 - pairs_df['cosine_similarity']
 
 scaler = StandardScaler()
-pairs_df['cosine_distance_scaled'] = scaler.fit_transform(pairs_df[['cosine_distance']])
 
+all_years = sorted(pairs_df['year'].unique())
+n_total_years = len(all_years)
+split_B_end = int(0.75 * n_total_years)
+
+train_mask = pairs_df['year'].isin(all_years[:split_B_end])
+scaler.fit(pairs_df.loc[train_mask, ['cosine_distance']])
+
+pairs_df['cosine_distance_scaled'] = scaler.transform(pairs_df[['cosine_distance']])
 
 cluster_name = "C-CD" # C-CD = Cosine Distance
 TO_ANALYSE_DF = pairs_df
 
 unique_years_sorted = sorted(pairs_df['year'].unique())
 
-threshold = -3.130
+# threshold = -3.130
+threshold = -3.326
 
 year_cluster_df = perform_clustering_per_year(
     TO_ANALYSE_DF,
@@ -341,7 +351,6 @@ year_cluster_PALM = pd.read_pickle(f"./data/Final Results/year_cluster_dfPaLM-ge
 
 cluster_name = "C-CD" # C-CD = Cosine Distance
 TO_ANALYSE_DF = pairs_df
-threshold = -3.130
 
 custom_cluster_avg_corr_CD = calculate_avg_correlation(TO_ANALYSE_DF, year_cluster_CD, "CustomClusterCD")
 custom_cluster_avg_corr_BERT = calculate_avg_correlation(TO_ANALYSE_DF, year_cluster_BERT, "CustomClusterBERT")
@@ -464,3 +473,4 @@ fig.write_image(f'./images/CD_PALM_final_plot_resized.png', scale=1, width=1920,
 
 # Show the figure
 fig.show()
+
