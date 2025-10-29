@@ -322,7 +322,7 @@ def optimise_cluster_parameters(TO_ANALYSE_DF, pairs_df, use_holdout=True):
 
     def objective(trial):
         # Suggest values for hyperparameters
-        threshold = trial.suggest_float('threshold', -3.53, -3.3, step=0.002)
+        threshold = trial.suggest_float('threshold', -6.5, -1, step=0.1)
         linkage_method = 'single'
 
         if use_holdout:
