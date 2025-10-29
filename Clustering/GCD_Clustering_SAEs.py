@@ -307,7 +307,7 @@ TO_ANALYSE_DF = pairs_df
 unique_years_sorted = sorted(pairs_df['year'].unique())
 
 # threshold = -3.130
-threshold = -3.530
+threshold = -2.7
 
 year_cluster_df = perform_clustering_per_year(
     TO_ANALYSE_DF,
