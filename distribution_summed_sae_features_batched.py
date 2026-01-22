@@ -40,7 +40,11 @@ for batch_idx in range(num_batches):
     batch_values = []
     for sample in batch:
         arr = np.array(sample['features'])
-        if len(arr.shape) > 0 and arr.shape[0] == DESIRED_LENGTH:
+        
+        # Handle nested structure: shape is (1, 131072) not (131072,)
+        if arr.ndim == 2 and arr.shape == (1, DESIRED_LENGTH):
+            batch_values.extend(arr[0])  # Extract the inner array
+        elif arr.ndim == 1 and arr.shape[0] == DESIRED_LENGTH:
             batch_values.extend(arr)
     
     if batch_values:
