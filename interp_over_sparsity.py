@@ -6,7 +6,7 @@ import random
 
 P = argparse.ArgumentParser()
 P.add_argument("--fuzzing_scores", default="./fuz_scores")
-P.add_argument("--strong_features_path", default="./data/double_cross_val_strong_features_clusters_random_subset.pkl")
+P.add_argument("--strong_features_path", default="./data/rolling_strong_features_clusters_random_subset.pkl")
 P.add_argument("--top_1_percent_clusters", default=25)
 P.add_argument("--out_image_path", default="interp_over_sparsity.png")
 
