@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 
 P = argparse.ArgumentParser()
-P.add_argument("--strong_features_path", default="strong_features_clusters_random_subset.pkl")
+P.add_argument("--strong_features_path", default="data/output/rolling_strong_features_clusters_random_subset.pkl")
 P.add_argument("--out_image_path", default="features_proportions.png")
 
 args = P.parse_args()
