@@ -3,6 +3,8 @@ Look into replacing the SAE and model with Gemma Scope 2 and Gemma 3.
 
 Nina:
 Look into what methods of dimensionality reduction would be best. 
+- seems like the recommended method would have been PCA, but we could do factor analysis or Principle Factor analysis, which are similar to PCA but do offer a change from the original paper
+- we could look at independent component analysis methods https://computing.llnl.gov/sites/default/files/148494.pdf which could offer non-linear dimension reduction, but not sure if that makese sense for our project
 Maybe also what clustering would be best. 
 - seems like "location" based clustering is best (K-means or centroid-based).
   - centroid based does not do well with noise, K-Means is only spherical results
