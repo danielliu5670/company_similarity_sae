@@ -4,5 +4,8 @@ Look into replacing the SAE and model with Gemma Scope 2 and Gemma 3.
 Nina:
 Look into what methods of dimensionality reduction would be best. 
 Maybe also what clustering would be best. 
+- seems like "location" based clustering is best (K-means or centroid-based).
+  - centroid based does not do well with noise, K-Means is only spherical results
+    - which of these do we consider to be less of an issue
 
 DUE: 2/5/2026
