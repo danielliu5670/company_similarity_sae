@@ -11,3 +11,11 @@ Maybe also what clustering would be best.
     - which of these do we consider to be less of an issue
 
 DUE: 2/5/2026
+
+
+Nina:
+- write the new clustering method into the code
+- see if changing the dimensionality reduction makes sense
+
+Daniel:
+- Try replacing models with Gemma 3 and Gemma Scope 2
