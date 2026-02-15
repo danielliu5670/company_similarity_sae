@@ -32,6 +32,7 @@ import torch, torch.distributed as dist
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 import joblib, datasets, pickle  # noqa: F401  (pickle re-import for type checkers)
 
@@ -77,7 +78,6 @@ def compute_cluster_coherence(Z: torch.Tensor, labels: np.ndarray) -> torch.Tens
 
 # ───────────────────────── CLI ─────────────────────────
 P = argparse.ArgumentParser()
-P = argparse.ArgumentParser()
 P.add_argument("--clusters-pkl", required=True,
               help="pickle with yearly cluster dicts (e.g. year_cluster_dfC-CD.pkl)")
 grp = P.add_mutually_exclusive_group()
@@ -116,17 +116,23 @@ else:
     print(f"[info] processing every cluster in file ({len(all_clusters)})")
 
 # ───────────────────────── DDP ─────────────────────────
-dist.init_process_group("nccl")
-rank, world = dist.get_rank(), dist.get_world_size()
-local_rank  = int(os.environ.get("LOCAL_RANK", 0))
-device      = torch.device(f"cuda:{local_rank}")
-torch.cuda.set_device(device)
+_DDP = "RANK" in os.environ
+if _DDP:
+    dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    local_rank  = int(os.environ.get("LOCAL_RANK", 0))
+    device      = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+else:
+    rank, world = 0, 1
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 warnings.filterwarnings("ignore")
 
-if rank == 0:
+if _DDP and rank == 0:
     for _ in tqdm(range(60), desc="⏳ init", total=60, position=0):
         torch.cuda._sleep(int(1e6))
-dist.barrier()
+if _DDP:
+    dist.barrier()
 
 # ───────────────────────── load data & PCA ─────────────────────────
 df_f = datasets.load_dataset(args.feature_ds)["train"].to_pandas()
@@ -135,8 +141,18 @@ df   = (pd.merge(df_f, df_c, on="__index_level_0__", how="inner")
           .dropna(subset=["sic_code", "features"]))
 df["features"] = df["features"].apply(lambda x: np.asarray(x[0], dtype=np.float32))
 
-scaler = StandardScaler().fit(np.vstack(df["features"].values))
-pca    = joblib.load(args.pca_model)       # 4000 PCs
+feat_matrix = np.vstack(df["features"].values)
+scaler = StandardScaler().fit(feat_matrix)
+
+if os.path.exists(args.pca_model):
+    pca = joblib.load(args.pca_model)
+else:
+    n_comp = min(4000, *feat_matrix.shape)
+    pca = PCA(n_components=n_comp).fit(scaler.transform(feat_matrix))
+    os.makedirs(os.path.dirname(args.pca_model) or ".", exist_ok=True)
+    joblib.dump(pca, args.pca_model)
+    if rank == 0:
+        print(f"[info] fitted and saved PCA ({n_comp} components) to {args.pca_model}")
 
 mean_t  = torch.tensor(scaler.mean_,  dtype=torch.float32, device=device)
 scale_t = torch.tensor(scaler.scale_, dtype=torch.float32, device=device)
@@ -245,8 +261,11 @@ for firms in pbar:
     }
 
 # ───────────────────────── gather & save ─────────────────────────
-gather = [None] * world
-dist.gather_object(local_out, gather if rank == 0 else None, dst=0)
+if _DDP:
+    gather = [None] * world
+    dist.gather_object(local_out, gather if rank == 0 else None, dst=0)
+else:
+    gather = [local_out]
 
 if rank == 0:
     merged = {}
@@ -256,6 +275,7 @@ if rank == 0:
         pickle.dump(merged, f)
     print(f"\n✅ wrote '{args.out}' with {len(merged)} clusters.")
 
-dist.barrier()
-dist.destroy_process_group()
+if _DDP:
+    dist.barrier()
+    dist.destroy_process_group()
 
