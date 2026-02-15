@@ -148,7 +148,7 @@ if os.path.exists(args.pca_model):
     pca = joblib.load(args.pca_model)
 else:
     n_comp = min(4000, *feat_matrix.shape)
-    pca = PCA(n_components=n_comp).fit(scaler.transform(feat_matrix))
+    pca = PCA(n_components=n_comp, random_state=42).fit(scaler.transform(feat_matrix))
     os.makedirs(os.path.dirname(args.pca_model) or ".", exist_ok=True)
     joblib.dump(pca, args.pca_model)
     if rank == 0:
