@@ -15,7 +15,9 @@ with open(args.strong_features_path, 'rb') as f:
     features_data = pickle.load(f)
 
 # Calculate the proportion of strong features for all keys
-strong_features_proportions = [len(features_data[k]['strong_features']) / 1000 for k in features_data.keys()]
+first_cluster = next(iter(features_data.values()))
+n_candidates = len(first_cluster['strong_features']) + len(first_cluster['weak_features'])
+strong_features_proportions = [len(features_data[k]['strong_features']) / n_candidates for k in features_data.keys()]
 
 # Create bin edges for deciles (0, 0.1, 0.2, ..., 1.0)
 bin_edges = [i/10 for i in range(11)]  # 0 to 1 in steps of 0.1

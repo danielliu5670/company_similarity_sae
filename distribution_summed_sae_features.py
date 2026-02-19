@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from datasets import load_dataset
 import matplotlib.pyplot as plt
@@ -7,13 +8,16 @@ import argparse
 
 P = argparse.ArgumentParser()
 P.add_argument("--img_path", type=str, default="images/distribution_summed_sae_features.png", help="Path to save the image")
+P.add_argument("--features-pkl", type=str, default=None, help="Local features pickle (overrides HuggingFace)")
 args = P.parse_args()
 
 
 
-# Load the dataset
-ds = load_dataset("marco-molinari/company_reports_with_features")
-sample = ds['train'].to_pandas()
+if args.features_pkl:
+    sample = pd.read_pickle(args.features_pkl)
+else:
+    ds = load_dataset("marco-molinari/company_reports_with_features")
+    sample = ds['train'].to_pandas()
 
 # Create the 'good_features' column and calculate mean
 sample['good_features'] = np.hstack(sample['features'].values)
@@ -21,8 +25,12 @@ mean_sample_features = sample['good_features']
 
 # Convert to numpy array to avoid pandas errors
 sample['good_features'] = sample['good_features']
-# Define the desired length
-desired_length = 131072
+first_valid = next(
+    (np.array(sample['good_features'][i]) for i in range(len(sample))
+     if np.array(sample['good_features'][i]).ndim > 0),
+    None,
+)
+desired_length = first_valid.shape[0] if first_valid is not None else 131072
 
 real_array = []
 

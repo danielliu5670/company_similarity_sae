@@ -68,6 +68,12 @@ P.add_argument("--cov-ds",default=("Mateusz1017/annual_reports_tokenized_llama3_
 P.add_argument("--pca-model",  default="../data/global_pca_model.pkl")
 P.add_argument("--scores-folder", default="./fuz_scores")
 P.add_argument("--out", default="strong_features_clusters_random_subset.pkl")
+P.add_argument("--local-features", default=None,
+               help="Local features pickle (overrides --feature-ds)")
+P.add_argument("--local-pairs", default=None,
+               help="Local pairs pickle (overrides --pairs-ds)")
+P.add_argument("--num-candidates", type=int, default=None,
+               help="Select N random candidate features (overrides --scores-folder)")
 args = P.parse_args()
 
 # ───── select clusters ─────
@@ -104,22 +110,33 @@ if rank == 0:
 dist.barrier()
 
 # ───────────────────────── load data & PCA ─────────────────────────
-df_f = datasets.load_dataset(args.feature_ds)["train"].to_pandas()
+if args.local_features:
+    df_f = pd.read_pickle(args.local_features)
+else:
+    df_f = datasets.load_dataset(args.feature_ds)["train"].to_pandas()
 df_c = datasets.load_dataset(args.cov_ds)["train"].to_pandas()
 df   = (pd.merge(df_f, df_c, on="__index_level_0__", how="inner")
           .dropna(subset=["sic_code", "features"]))
 df["features"] = df["features"].apply(lambda x: np.asarray(x[0], dtype=np.float32))
 
 scaler = StandardScaler().fit(np.vstack(df["features"].values))
-pca    = joblib.load(args.pca_model)       # 4000 PCs
+pca_loaded = joblib.load(args.pca_model)
+pca = pca_loaded["pca"] if isinstance(pca_loaded, dict) else pca_loaded
 
 mean_t  = torch.tensor(scaler.mean_,  dtype=torch.float32, device=device)
 scale_t = torch.tensor(scaler.scale_, dtype=torch.float32, device=device)
 W_t     = torch.tensor(pca.components_.T, dtype=torch.float32, device=device)  # (D,P)
 
-pairs_full = datasets.load_dataset(args.pairs_ds)["train"].to_pandas()
-cand_idx   = load_scored_latents(args.scores_folder, 1000)
+if args.local_pairs:
+    pairs_full = pd.read_pickle(args.local_pairs)
+else:
+    pairs_full = datasets.load_dataset(args.pairs_ds)["train"].to_pandas()
 vec_dim    = df["features"].iat[0].shape[0]
+if args.num_candidates is not None:
+    rng = np.random.default_rng(42)
+    cand_idx = rng.choice(vec_dim, size=min(args.num_candidates, vec_dim), replace=False).astype(int)
+else:
+    cand_idx = load_scored_latents(args.scores_folder, 1000)
 
 # ───────────────────────── main loop ─────────────────────────
 my_clusters = [c for i, c in enumerate(all_clusters) if i % world == rank]

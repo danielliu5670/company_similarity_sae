@@ -93,6 +93,10 @@ P.add_argument("--scores-folder", default="./fuz_scores")
 P.add_argument("--n-clusters", type=int, default=5,
               help="number of k-means clusters (default: 5)")
 P.add_argument("--out", default="strong_features_clusters_random_subset.pkl")
+P.add_argument("--local-features", default=None,
+               help="Local features pickle (overrides --feature-ds)")
+P.add_argument("--num-candidates", type=int, default=None,
+               help="Select N random candidate features (overrides --scores-folder)")
 args = P.parse_args()
 
 # ───── select clusters ─────
@@ -135,7 +139,10 @@ if _DDP:
     dist.barrier()
 
 # ───────────────────────── load data & PCA ─────────────────────────
-df_f = datasets.load_dataset(args.feature_ds)["train"].to_pandas()
+if args.local_features:
+    df_f = pd.read_pickle(args.local_features)
+else:
+    df_f = datasets.load_dataset(args.feature_ds)["train"].to_pandas()
 df_c = datasets.load_dataset(args.cov_ds)["train"].to_pandas()
 df   = (pd.merge(df_f, df_c, on="__index_level_0__", how="inner")
           .dropna(subset=["sic_code", "features"]))
@@ -145,7 +152,8 @@ feat_matrix = np.vstack(df["features"].values)
 scaler = StandardScaler().fit(feat_matrix)
 
 if os.path.exists(args.pca_model):
-    pca = joblib.load(args.pca_model)
+    pca_loaded = joblib.load(args.pca_model)
+    pca = pca_loaded["pca"] if isinstance(pca_loaded, dict) else pca_loaded
 else:
     n_comp = min(4000, *feat_matrix.shape)
     pca = PCA(n_components=n_comp, random_state=42).fit(scaler.transform(feat_matrix))
@@ -158,8 +166,12 @@ mean_t  = torch.tensor(scaler.mean_,  dtype=torch.float32, device=device)
 scale_t = torch.tensor(scaler.scale_, dtype=torch.float32, device=device)
 W_t     = torch.tensor(pca.components_.T, dtype=torch.float32, device=device)  # (D,P)
 
-cand_idx   = load_scored_latents(args.scores_folder, 1000)
 vec_dim    = df["features"].iat[0].shape[0]
+if args.num_candidates is not None:
+    rng = np.random.default_rng(42)
+    cand_idx = rng.choice(vec_dim, size=min(args.num_candidates, vec_dim), replace=False).astype(int)
+else:
+    cand_idx = load_scored_latents(args.scores_folder, 1000)
 
 # ───────────────────────── main loop ─────────────────────────
 my_clusters = [c for i, c in enumerate(all_clusters) if i % world == rank]
