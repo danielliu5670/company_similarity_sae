@@ -93,9 +93,10 @@ model = AutoModelForCausalLM.from_pretrained(
     args.model,
     torch_dtype=torch.bfloat16,
     device_map=args.device,
-    low_cpu_mem_usage=True,
+    
 )
 model.eval()
+model.gradient_checkpointing_enable()
 
 print("Loading company descriptions...")
 ds = load_dataset(args.descriptions_ds)
