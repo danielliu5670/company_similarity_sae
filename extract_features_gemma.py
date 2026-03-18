@@ -63,7 +63,7 @@ P.add_argument("--sae-repo", default="google/gemma-scope-2-12b-pt")
 P.add_argument("--sae-path", default="resid_post/layer_41_width_65k_l0_medium")
 P.add_argument("--layer", type=int, default=41)
 P.add_argument("--batch-size", type=int, default=2)
-P.add_argument("--max-length", type=int, default=640)
+P.add_argument("--max-length", type=int, default=256)
 P.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 P.add_argument("--output", default="data/gemma_features.pkl")
 P.add_argument(
