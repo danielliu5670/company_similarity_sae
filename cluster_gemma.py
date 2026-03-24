@@ -10,6 +10,7 @@ import joblib
 from datasets import load_dataset
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.cluster import SpectralClustering
 from tqdm import tqdm
 
 
@@ -66,6 +67,8 @@ def perform_kmeans_clustering_per_year(feat_df, years, target_k_per_year):
             continue
 
         Z_cpu = np.vstack(year_data["pca_features"].values)
+        row_norms = np.linalg.norm(Z_cpu, axis=1, keepdims=True).clip(min=1e-10)
+        Z_cpu = Z_cpu / row_norms
         kmeans = KMeans(n_clusters=min(k, len(Z_cpu)), random_state=42, n_init=10)
         labels = kmeans.fit_predict(Z_cpu)
 
@@ -74,6 +77,60 @@ def perform_kmeans_clustering_per_year(feat_df, years, target_k_per_year):
         for label in np.unique(labels):
             companies = sorted(ids[labels == label].tolist())
             cluster_dict[int(label) + 1] = companies
+
+        results.append({"year": year, "clusters": cluster_dict})
+
+    return pd.DataFrame(results)
+
+def perform_spectral_clustering_per_year(pairs_df, years, target_k_per_year):
+    results = []
+    for year in tqdm(years, desc="Spectral clustering"):
+        year_df = pairs_df[pairs_df["year"] == year]
+        if year_df.empty:
+            results.append({"year": year, "clusters": {}})
+            continue
+
+        k = target_k_per_year.get(year, 5)
+
+        companies = sorted(
+            set(year_df["Company1"].tolist() + year_df["Company2"].tolist())
+        )
+        n = len(companies)
+
+        if n < 2 or k < 2:
+            results.append({"year": year, "clusters": {}})
+            continue
+
+        k = min(k, n)
+        comp_to_idx = {c: i for i, c in enumerate(companies)}
+
+        # Build a precomputed affinity matrix from cosine similarities
+        affinity = np.eye(n, dtype=np.float32)
+        idx1 = year_df["Company1"].map(comp_to_idx).values
+        idx2 = year_df["Company2"].map(comp_to_idx).values
+        sims = year_df["cosine_similarity"].values.astype(np.float32).clip(min=0)
+
+        affinity[idx1, idx2] = sims
+        affinity[idx2, idx1] = sims
+
+        try:
+            sc = SpectralClustering(
+                n_clusters=k,
+                affinity="precomputed",
+                random_state=42,
+                assign_labels="kmeans",
+                n_init=10,
+            )
+            labels = sc.fit_predict(affinity)
+        except Exception:
+            results.append({"year": year, "clusters": {}})
+            continue
+
+        cluster_dict = {}
+        companies_arr = np.array(companies)
+        for label in np.unique(labels):
+            members = sorted(companies_arr[labels == label].tolist())
+            cluster_dict[int(label) + 1] = members
 
         results.append({"year": year, "clusters": cluster_dict})
 
@@ -113,6 +170,7 @@ P.add_argument("--pairs-pkl", required=True)
 P.add_argument("--threshold", type=float, default=-2.7)
 P.add_argument("--out-clusters", default="data/gemma_year_cluster_dfC-CD.pkl")
 P.add_argument("--out-clusters-kmeans", default="data/gemma_year_cluster_dfC-CD_kmeans.pkl")
+P.add_argument("--out-clusters-spectral", default="data/gemma_year_cluster_dfC-CD_spectral.pkl")
 P.add_argument("--features-pkl", default=None)
 P.add_argument("--pca-model", default=None)
 P.add_argument(
@@ -162,6 +220,7 @@ year_cluster_df.to_pickle(args.out_clusters)
 print(f"Saved MST clusters to {args.out_clusters}")
 
 year_kmeans_cluster_df = None
+year_spectral_cluster_df = None 
 if args.features_pkl and args.pca_model:
     print("\nLoading features + PCA for K-means clustering...")
     df_f = pd.read_pickle(args.features_pkl)
@@ -194,6 +253,14 @@ if args.features_pkl and args.pca_model:
 
     year_kmeans_cluster_df.to_pickle(args.out_clusters_kmeans)
     print(f"Saved K-means clusters to {args.out_clusters_kmeans}")
+    print(f"  Spectral clustering with k matched to MST cluster count per year...")
+    year_spectral_cluster_df = perform_spectral_clustering_per_year(
+        pairs_df, all_years, mst_cluster_counts
+    )
+    year_spectral_cluster_df["year"] = year_spectral_cluster_df["year"].astype(int)
+
+    year_spectral_cluster_df.to_pickle(args.out_clusters_spectral)
+    print(f"Saved spectral clusters to {args.out_clusters_spectral}")
 
 print("\nLoading company metadata for SIC baseline...")
 df_compinfo = load_dataset(args.cov_ds)["train"].to_pandas()
@@ -223,6 +290,12 @@ if year_kmeans_cluster_df is not None:
     )
     results = pd.merge(results, gemma_km_corr, on="year", how="outer")
 
+if year_spectral_cluster_df is not None:
+    gemma_sp_corr = calculate_avg_correlation(
+        pairs_df, year_spectral_cluster_df, "GemmaSpectral"
+    )
+    results = pd.merge(results, gemma_sp_corr, on="year", how="outer")
+
 pop_corr = pairs_df["correlation"].mean()
 
 print("\n" + "=" * 65)
@@ -231,6 +304,8 @@ print("=" * 65)
 print(f"  Gemma SAE (MST):      {results['GemmaMSTAvgCorrelation'].mean():.4f}")
 if year_kmeans_cluster_df is not None:
     print(f"  Gemma SAE (K-means):  {results['GemmaKMeansAvgCorrelation'].mean():.4f}")
+if year_spectral_cluster_df is not None:
+    print(f"  Gemma SAE (Spectral):  {results['GemmaSpectralAvgCorrelation'].mean():.4f}")
 print(f"  SIC code clusters:    {results['SICAvgCorrelation'].mean():.4f}")
 print(f"  Population mean:      {pop_corr:.4f}")
 print("=" * 65)
