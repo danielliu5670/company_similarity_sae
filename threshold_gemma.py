@@ -21,6 +21,7 @@ import joblib
 from datasets import load_dataset
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.cluster import SpectralClustering
 from tqdm import tqdm
 
 
@@ -57,6 +58,55 @@ def perform_clustering_per_year(pairs_df, years, threshold):
             idx: sorted(list(c)) for idx, c in enumerate(clusters, start=1)
         }
         cluster_dict = {k: v for k, v in cluster_dict.items() if k != -1}
+
+        results.append({"year": year, "clusters": cluster_dict})
+
+    return pd.DataFrame(results)
+
+def perform_spectral_clustering_per_year(pairs_df, years, target_k_per_year):
+    results = []
+    for year in years:
+        year_df = pairs_df[pairs_df["year"] == year]
+        if year_df.empty:
+            results.append({"year": year, "clusters": {}})
+            continue
+
+        k = target_k_per_year.get(year, 5)
+
+        companies = sorted(
+            set(year_df["Company1"].tolist() + year_df["Company2"].tolist())
+        )
+        n = len(companies)
+
+        if n < 2 or k < 2:
+            results.append({"year": year, "clusters": {}})
+            continue
+
+        k = min(k, n)
+        comp_to_idx = {c: i for i, c in enumerate(companies)}
+
+        affinity = np.eye(n, dtype=np.float32)
+        idx1 = year_df["Company1"].map(comp_to_idx).values
+        idx2 = year_df["Company2"].map(comp_to_idx).values
+        sims = year_df["cosine_similarity"].values.astype(np.float32).clip(min=0)
+
+        affinity[idx1, idx2] = sims
+        affinity[idx2, idx1] = sims
+
+        sc = SpectralClustering(
+            n_clusters=k,
+            affinity="precomputed",
+            random_state=42,
+            assign_labels="kmeans",
+            n_init=10,
+        )
+        labels = sc.fit_predict(affinity)
+
+        cluster_dict = {}
+        companies_arr = np.array(companies)
+        for label in np.unique(labels):
+            members = sorted(companies_arr[labels == label].tolist())
+            cluster_dict[int(label) + 1] = members
 
         results.append({"year": year, "clusters": cluster_dict})
 
@@ -217,6 +267,8 @@ for _, row in all_cluster_df.iterrows():
 # ------------------------------------------------------------------
 kmeans_test_corr = np.nan
 kmeans_all_corr = np.nan
+spectral_test_corr = np.nan
+spectral_all_corr = np.nan
 
 if args.features_pkl and args.pca_model:
     print("\nLoading features + PCA for K-means clustering...")
@@ -251,6 +303,16 @@ if args.features_pkl and args.pca_model:
     km_all_df = perform_kmeans_clustering_per_year(df_feat, all_years, all_mst_cluster_counts)
     km_all_corr_df = calculate_avg_correlation(pairs_df, km_all_df)
     kmeans_all_corr = km_all_corr_df["avg_corr"].mean()
+
+    # Spectral - test years
+    sp_test_df = perform_spectral_clustering_per_year(pairs_df, test_years, mst_cluster_counts)
+    sp_test_corr_df = calculate_avg_correlation(pairs_df, sp_test_df)
+    spectral_test_corr = sp_test_corr_df["avg_corr"].mean()
+
+    # Spectral - all years
+    sp_all_df = perform_spectral_clustering_per_year(pairs_df, all_years, all_mst_cluster_counts)
+    sp_all_corr_df = calculate_avg_correlation(pairs_df, sp_all_df)
+    spectral_all_corr = sp_all_corr_df["avg_corr"].mean()
 
     del feat_matrix, scaled, pca_features
     import gc; gc.collect()
@@ -293,6 +355,7 @@ print("=" * 70)
 print(f"{'':30s} {'OOS (test)':>12s} {'All years':>12s}")
 print(f"  {'Gemma SAE (MST)':30s} {test_mean_corr:>12.4f} {all_mean_corr:>12.4f}")
 print(f"  {'Gemma SAE (K-means)':30s} {kmeans_test_corr:>12.4f} {kmeans_all_corr:>12.4f}")
+print(f"  {'Gemma SAE (Spectral)':30s} {spectral_test_corr:>12.4f} {spectral_all_corr:>12.4f}")
 print(f"  {'SIC code clusters':30s} {sic_test_corr:>12.4f} {sic_all_corr:>12.4f}")
 print(f"  {'Population mean':30s} {pop_corr:>12.4f} {pop_corr:>12.4f}")
 print("=" * 70)
