@@ -158,7 +158,7 @@ def main():
                     help="L1 penalty on attention weights (tune this)")
     P.add_argument("--epochs", type=int, default=30)
     P.add_argument("--batch-size", type=int, default=4096)
-    P.add_argument("--train-sample", type=int, default=1_000_000,
+    P.add_argument("--train-sample", type=int, default=500_000,
                     help="Subsample training pairs for speed")
     P.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     P.add_argument("--theta-min", type=float, default=-4.5)
@@ -175,11 +175,16 @@ def main():
     # ------------------------------------------------------------------
     print("Loading pairs...")
     pairs_df = pd.read_pickle(args.pairs_pkl)
-    pairs_df["year"] = pairs_df["year"].astype(int)
+    keep_cols = ["Company1", "Company2", "year", "correlation", "cosine_similarity"]
+    pairs_df = pairs_df[[c for c in keep_cols if c in pairs_df.columns]]
+    pairs_df["year"] = pairs_df["year"].astype(np.int16)
     pairs_df = pairs_df.dropna(subset=["correlation"])
+    pairs_df["correlation"] = pairs_df["correlation"].astype(np.float32)
+    pairs_df["cosine_similarity"] = pairs_df["cosine_similarity"].astype(np.float32)
     pairs_df["Company1"] = pairs_df["Company1"].astype(str)
     pairs_df["Company2"] = pairs_df["Company2"].astype(str)
     print(f"  {len(pairs_df)} pairs loaded")
+    gc.collect()
 
     # ------------------------------------------------------------------
     # Temporal split
@@ -213,7 +218,7 @@ def main():
     pca = pca_loaded["pca"] if isinstance(pca_loaded, dict) else pca_loaded
 
     pca_features = (feat_scaler.transform(feat_matrix) @ pca.components_.T).astype(
-        np.float32
+        np.float16
     )
     dim = pca_features.shape[1]
     print(f"  PCA features: {pca_features.shape}")
@@ -268,7 +273,7 @@ def main():
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True,
     )
 
