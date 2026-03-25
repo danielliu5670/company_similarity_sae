@@ -119,7 +119,8 @@ def calculate_avg_correlation(pairs_df, cluster_df):
         year = row["year"]
         clusters = row["clusters"]
         year_data = pairs_df[pairs_df["year"] == year]
-        cluster_stats = []
+        total_corr_sum = 0.0
+        total_pair_count = 0
 
         for companies in clusters.values():
             if len(companies) <= 1:
@@ -129,10 +130,11 @@ def calculate_avg_correlation(pairs_df, cluster_df):
                 & year_data["Company2"].isin(companies)
             ]
             if not cluster_pairs.empty:
-                cluster_stats.append(cluster_pairs["correlation"].mean())
+                total_corr_sum += cluster_pairs["correlation"].sum()
+                total_pair_count += len(cluster_pairs)
 
-        if cluster_stats:
-            avg_correlations.append({"year": year, "avg_corr": np.mean(cluster_stats)})
+        if total_pair_count > 0:
+            avg_correlations.append({"year": year, "avg_corr": total_corr_sum / total_pair_count})
         else:
             avg_correlations.append({"year": year, "avg_corr": np.nan})
 
