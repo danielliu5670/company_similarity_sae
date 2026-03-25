@@ -40,9 +40,11 @@ if isinstance(sample_feat, (list, np.ndarray)):
     print(f"unwrapped type: {type(flat)}, len: {len(flat) if hasattr(flat, '__len__') else 'N/A'}")
 
 def unwrap_feature(x):
-    while isinstance(x, list) and len(x) == 1 and isinstance(x[0], (list, np.ndarray)):
+    while hasattr(x, '__len__') and len(x) == 1:
         x = x[0]
-    return np.asarray(x, dtype=np.float32).flatten()
+    if isinstance(x, np.ndarray):
+        return x.astype(np.float32).flatten()
+    return np.array(x, dtype=np.float32).flatten()
 
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 print(f"  Final feature shape: {df_f['features'].iloc[0].shape}")
