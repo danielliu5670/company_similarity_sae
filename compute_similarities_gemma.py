@@ -32,18 +32,20 @@ print("Loading Gemma features...")
 df_f = pd.read_pickle(args.features_pkl)
 
 sample_feat = df_f["features"].iloc[0]
-if isinstance(sample_feat, list):
-    if len(sample_feat) == 1 and hasattr(sample_feat[0], '__len__'):
-        df_f["features"] = df_f["features"].apply(lambda x: np.asarray(x[0], dtype=np.float32))
-    else:
-        df_f["features"] = df_f["features"].apply(lambda x: np.asarray(x, dtype=np.float32))
-elif isinstance(sample_feat, np.ndarray):
-    if sample_feat.ndim == 2 and sample_feat.shape[0] == 1:
-        df_f["features"] = df_f["features"].apply(lambda x: x[0].astype(np.float32))
-    else:
-        df_f["features"] = df_f["features"].apply(lambda x: np.asarray(x, dtype=np.float32))
-else:
-    df_f["features"] = df_f["features"].apply(lambda x: np.asarray(x, dtype=np.float32))
+print(f"  Feature type: {type(sample_feat)}, ", end="")
+if isinstance(sample_feat, (list, np.ndarray)):
+    flat = sample_feat
+    while isinstance(flat, list) and len(flat) == 1 and isinstance(flat[0], (list, np.ndarray)):
+        flat = flat[0]
+    print(f"unwrapped type: {type(flat)}, len: {len(flat) if hasattr(flat, '__len__') else 'N/A'}")
+
+def unwrap_feature(x):
+    while isinstance(x, list) and len(x) == 1 and isinstance(x[0], (list, np.ndarray)):
+        x = x[0]
+    return np.asarray(x, dtype=np.float32).flatten()
+
+df_f["features"] = df_f["features"].apply(unwrap_feature)
+print(f"  Final feature shape: {df_f['features'].iloc[0].shape}")
 
 print("Loading company metadata...")
 df_c = load_dataset(args.cov_ds)["train"].to_pandas()
