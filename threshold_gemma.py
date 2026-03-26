@@ -273,7 +273,7 @@ spectral_test_corr = np.nan
 spectral_all_corr = np.nan
 
 if args.features_pkl and args.pca_model:
-    print("\nLoading features + PCA for K-means clustering...")
+    print("\nLoading features + model for K-means clustering...")
     df_f = pd.read_pickle(args.features_pkl)
     df_f["features"] = df_f["features"].apply(
         lambda x: np.asarray(x[0], dtype=np.float32)
@@ -287,14 +287,25 @@ if args.features_pkl and args.pca_model:
     df_feat["year"] = df_feat["year"].astype(int)
 
     feat_matrix = np.vstack(df_feat["features"].values)
-    feat_scaler = StandardScaler().fit(feat_matrix)
 
-    pca_loaded = joblib.load(args.pca_model)
-    pca = pca_loaded["pca"] if isinstance(pca_loaded, dict) else pca_loaded
+    model_loaded = joblib.load(args.pca_model)
 
-    scaled = feat_scaler.transform(feat_matrix)
-    pca_features = scaled @ pca.components_.T
-    df_feat["pca_features"] = list(pca_features)
+    if isinstance(model_loaded, dict) and "selected_indices" in model_loaded:
+        # Supervised feature selection model
+        selected = model_loaded["selected_indices"]
+        scaler = model_loaded["scaler"]
+        selected_feats = feat_matrix[:, selected]
+        reduced_features = scaler.transform(selected_feats)
+        print(f"  Using supervised selection: {len(selected)} features")
+    else:
+        # Legacy PCA model
+        pca = model_loaded["pca"] if isinstance(model_loaded, dict) else model_loaded
+        feat_scaler = StandardScaler().fit(feat_matrix)
+        scaled = feat_scaler.transform(feat_matrix)
+        reduced_features = scaled @ pca.components_.T
+        print(f"  Using PCA: {pca.n_components_} components")
+
+    df_feat["pca_features"] = list(reduced_features)
 
     # Test years
     km_test_df = perform_kmeans_clustering_per_year(df_feat, test_years, mst_cluster_counts)
