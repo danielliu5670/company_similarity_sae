@@ -156,13 +156,29 @@ print(f"Scoring {feat_dim} features (min support = {args.min_support} pairs)..."
 scores = np.zeros(feat_dim, dtype=np.float64)
 support = np.zeros(feat_dim, dtype=np.int64)
 
-for j in tqdm(range(feat_dim), desc="Scoring features"):
-    col = binary_matrix[:, j]
-    co_active = col[idx1_train] & col[idx2_train]
-    n = co_active.sum()
-    if n >= args.min_support:
-        scores[j] = corr_train[co_active].mean() - pop_mean
-        support[j] = n
+chunk_size = 128
+n_chunks = (feat_dim + chunk_size - 1) // chunk_size
+
+for ci in tqdm(range(n_chunks), desc="Scoring features (chunked)"):
+    j_start = ci * chunk_size
+    j_end = min(j_start + chunk_size, feat_dim)
+
+    cols = binary_matrix[:, j_start:j_end]        # (n_companies, chunk) bool
+    b1 = cols[idx1_train]                          # (n_pairs, chunk) bool
+    b2 = cols[idx2_train]                          # (n_pairs, chunk) bool
+    co = b1 & b2
+    del b1, b2
+
+    counts = co.sum(axis=0)                        # (chunk,)
+    corr_sums = corr_train @ co.astype(np.float32) # (chunk,)
+    del co
+
+    for local_j in range(j_end - j_start):
+        j = j_start + local_j
+        n = counts[local_j]
+        if n >= args.min_support:
+            scores[j] = corr_sums[local_j] / n - pop_mean
+            support[j] = int(n)
 
 # ------------------------------------------------------------------
 # Select top-k features with positive scores
