@@ -204,10 +204,10 @@ del binary_matrix
 # ------------------------------------------------------------------
 # Scale selected features
 # ------------------------------------------------------------------
-print("Scaling selected features...")
+print("Extracting selected features...")
 selected_features = feat_matrix[:, selected]
-scaler = StandardScaler().fit(selected_features)
-scaled_features = scaler.transform(selected_features)
+scaled_features = selected_features
+scaler = None
 
 # ------------------------------------------------------------------
 # Save model (selected indices + scaler + scores for interpretability)

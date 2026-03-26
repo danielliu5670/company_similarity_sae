@@ -275,9 +275,14 @@ spectral_all_corr = np.nan
 if args.features_pkl and args.pca_model:
     print("\nLoading features + model for K-means clustering...")
     df_f = pd.read_pickle(args.features_pkl)
-    df_f["features"] = df_f["features"].apply(
-        lambda x: np.asarray(x[0], dtype=np.float32)
-    )
+    def unwrap_feature(x):
+        while hasattr(x, '__len__') and len(x) == 1:
+            x = x[0]
+        if isinstance(x, np.ndarray):
+            return x.astype(np.float32).flatten()
+        return np.array(x, dtype=np.float32).flatten()
+
+    df_f["features"] = df_f["features"].apply(unwrap_feature)
     df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
 
     df_c = load_dataset(args.cov_ds)["train"].to_pandas()
@@ -295,7 +300,7 @@ if args.features_pkl and args.pca_model:
         selected = model_loaded["selected_indices"]
         scaler = model_loaded["scaler"]
         selected_feats = feat_matrix[:, selected]
-        reduced_features = scaler.transform(selected_feats)
+        reduced_features = scaler.transform(selected_feats) if scaler is not None else selected_feats
         print(f"  Using supervised selection: {len(selected)} features")
     else:
         # Legacy PCA model
@@ -327,7 +332,7 @@ if args.features_pkl and args.pca_model:
     sp_all_corr_df = calculate_avg_correlation(pairs_df, sp_all_df)
     spectral_all_corr = sp_all_corr_df["avg_corr"].mean()
 
-    del feat_matrix, scaled, pca_features
+    del feat_matrix, reduced_features
     import gc; gc.collect()
 
 # ------------------------------------------------------------------
