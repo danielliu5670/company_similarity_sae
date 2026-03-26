@@ -267,10 +267,35 @@ for _, row in all_cluster_df.iterrows():
 # ------------------------------------------------------------------
 # K-means (if features + PCA model provided)
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Load SIC data early (needed for spectral k-sweep)
+# ------------------------------------------------------------------
+print("\nLoading company metadata for SIC baseline...")
+df_compinfo = load_dataset(args.cov_ds)["train"].to_pandas()
+df_compinfo = df_compinfo[["cik", "year", "sic_code", "__index_level_0__"]]
+df_compinfo = df_compinfo.dropna(subset=["sic_code"])
+df_compinfo["__index_level_0__"] = df_compinfo["__index_level_0__"].astype(str)
+df_compinfo["year"] = df_compinfo["year"].astype(int)
+
+year_SIC_cluster_df = []
+sic_k_per_year = {}
+for year in sorted(df_compinfo["year"].unique()):
+    year_data = df_compinfo[df_compinfo["year"] == year]
+    sic_clusters = (
+        year_data.groupby("sic_code")["__index_level_0__"].apply(list).to_dict()
+    )
+    year_SIC_cluster_df.append({"year": year, "clusters": sic_clusters})
+    sic_k_per_year[year] = len(sic_clusters)
+year_SIC_cluster_df = pd.DataFrame(year_SIC_cluster_df)
+year_SIC_cluster_df["year"] = year_SIC_cluster_df["year"].astype(int)
+
 kmeans_test_corr = np.nan
 kmeans_all_corr = np.nan
 spectral_test_corr = np.nan
 spectral_all_corr = np.nan
+spectral_sweep_test_corr = np.nan
+spectral_sweep_all_corr = np.nan
+best_spectral_k_label = "N/A"
 
 if args.features_pkl and args.pca_model:
     print("\nLoading features + model for K-means clustering...")
@@ -332,29 +357,83 @@ if args.features_pkl and args.pca_model:
     sp_all_corr_df = calculate_avg_correlation(pairs_df, sp_all_df)
     spectral_all_corr = sp_all_corr_df["avg_corr"].mean()
 
+    # ------------------------------------------------------------------
+    # Spectral k-sweep on train years
+    # ------------------------------------------------------------------
+    print("\nSpectral k-sweep on train years...")
+
+    # Build candidate k multipliers of SIC counts
+    k_candidates = {}
+    # "sic" = use exact SIC code count per year
+    k_candidates["sic_count"] = {y: sic_k_per_year.get(y, 50) for y in train_years}
+    # fixed k values
+    for fixed_k in [10, 20, 50, 100, 200]:
+        k_candidates[f"fixed_{fixed_k}"] = {y: fixed_k for y in train_years}
+    # fractions of SIC count
+    for frac, label in [(0.5, "sic_x0.5"), (2.0, "sic_x2.0")]:
+        k_candidates[label] = {
+            y: max(2, int(sic_k_per_year.get(y, 50) * frac)) for y in train_years
+        }
+
+    spectral_sweep_results = []
+    best_spectral_train_corr = -np.inf
+
+    for label, k_per_year in tqdm(k_candidates.items(), desc="Spectral k-sweep"):
+        sp_df = perform_spectral_clustering_per_year(pairs_df, train_years, k_per_year)
+        sp_corr_df = calculate_avg_correlation(pairs_df, sp_df)
+        mean_corr = sp_corr_df["avg_corr"].mean()
+        spectral_sweep_results.append({"k_label": label, "train_mean_corr": mean_corr})
+
+        if not np.isnan(mean_corr) and mean_corr > best_spectral_train_corr:
+            best_spectral_train_corr = mean_corr
+            best_spectral_k_label = label
+            best_spectral_k_per_year = k_per_year
+
+    print(f"\n  Best spectral k config: {best_spectral_k_label} "
+          f"(train MC = {best_spectral_train_corr:.4f})")
+    print("\n  Spectral k-sweep summary:")
+    print(f"  {'config':>12s}  {'train_MC':>10s}")
+    for r in spectral_sweep_results:
+        marker = " <-- best" if r["k_label"] == best_spectral_k_label else ""
+        print(f"  {r['k_label']:>12s}  {r['train_mean_corr']:>10.4f}{marker}")
+
+    # Evaluate best spectral k on test years
+    best_k_test = {}
+    for y in test_years:
+        if best_spectral_k_label == "sic_count":
+            best_k_test[y] = sic_k_per_year.get(y, 50)
+        elif best_spectral_k_label.startswith("fixed_"):
+            best_k_test[y] = int(best_spectral_k_label.split("_")[1])
+        elif best_spectral_k_label == "sic_x0.5":
+            best_k_test[y] = max(2, int(sic_k_per_year.get(y, 50) * 0.5))
+        elif best_spectral_k_label == "sic_x2.0":
+            best_k_test[y] = max(2, int(sic_k_per_year.get(y, 50) * 2.0))
+
+    best_k_all = {}
+    for y in all_years:
+        if best_spectral_k_label == "sic_count":
+            best_k_all[y] = sic_k_per_year.get(y, 50)
+        elif best_spectral_k_label.startswith("fixed_"):
+            best_k_all[y] = int(best_spectral_k_label.split("_")[1])
+        elif best_spectral_k_label == "sic_x0.5":
+            best_k_all[y] = max(2, int(sic_k_per_year.get(y, 50) * 0.5))
+        elif best_spectral_k_label == "sic_x2.0":
+            best_k_all[y] = max(2, int(sic_k_per_year.get(y, 50) * 2.0))
+
+    sp_sweep_test_df = perform_spectral_clustering_per_year(pairs_df, test_years, best_k_test)
+    sp_sweep_test_corr_df = calculate_avg_correlation(pairs_df, sp_sweep_test_df)
+    spectral_sweep_test_corr = sp_sweep_test_corr_df["avg_corr"].mean()
+
+    sp_sweep_all_df = perform_spectral_clustering_per_year(pairs_df, all_years, best_k_all)
+    sp_sweep_all_corr_df = calculate_avg_correlation(pairs_df, sp_sweep_all_df)
+    spectral_sweep_all_corr = sp_sweep_all_corr_df["avg_corr"].mean()
+
     del feat_matrix, reduced_features
     import gc; gc.collect()
 
 # ------------------------------------------------------------------
-# SIC baseline
+# SIC baseline (data already loaded above)
 # ------------------------------------------------------------------
-print("\nLoading company metadata for SIC baseline...")
-df_compinfo = load_dataset(args.cov_ds)["train"].to_pandas()
-df_compinfo = df_compinfo[["cik", "year", "sic_code", "__index_level_0__"]]
-df_compinfo = df_compinfo.dropna(subset=["sic_code"])
-df_compinfo["__index_level_0__"] = df_compinfo["__index_level_0__"].astype(str)
-df_compinfo["year"] = df_compinfo["year"].astype(int)
-
-year_SIC_cluster_df = []
-for year in sorted(df_compinfo["year"].unique()):
-    year_data = df_compinfo[df_compinfo["year"] == year]
-    sic_clusters = (
-        year_data.groupby("sic_code")["__index_level_0__"].apply(list).to_dict()
-    )
-    year_SIC_cluster_df.append({"year": year, "clusters": sic_clusters})
-year_SIC_cluster_df = pd.DataFrame(year_SIC_cluster_df)
-year_SIC_cluster_df["year"] = year_SIC_cluster_df["year"].astype(int)
-
 sic_test_df = year_SIC_cluster_df[year_SIC_cluster_df["year"].isin(test_years)]
 sic_test_corr_df = calculate_avg_correlation(pairs_df, sic_test_df)
 sic_test_corr = sic_test_corr_df["avg_corr"].mean()
@@ -368,12 +447,13 @@ pop_corr = pairs_df["correlation"].mean()
 # Report
 # ------------------------------------------------------------------
 print("\n" + "=" * 70)
-print(f"RESULTS   (best θ = {best_theta:.2f}, selected on train years)")
+print(f"RESULTS   (best θ = {best_theta:.2f}, spectral k = {best_spectral_k_label})")
 print("=" * 70)
-print(f"{'':30s} {'OOS (test)':>12s} {'All years':>12s}")
-print(f"  {'Gemma SAE (MST)':30s} {test_mean_corr:>12.4f} {all_mean_corr:>12.4f}")
-print(f"  {'Gemma SAE (K-means)':30s} {kmeans_test_corr:>12.4f} {kmeans_all_corr:>12.4f}")
-print(f"  {'Gemma SAE (Spectral)':30s} {spectral_test_corr:>12.4f} {spectral_all_corr:>12.4f}")
-print(f"  {'SIC code clusters':30s} {sic_test_corr:>12.4f} {sic_all_corr:>12.4f}")
-print(f"  {'Population mean':30s} {pop_corr:>12.4f} {pop_corr:>12.4f}")
+print(f"{'':40s} {'OOS (test)':>12s} {'All years':>12s}")
+print(f"  {'SAE (MST, θ-sweep)':40s} {test_mean_corr:>12.4f} {all_mean_corr:>12.4f}")
+print(f"  {'SAE (K-means, MST-matched k)':40s} {kmeans_test_corr:>12.4f} {kmeans_all_corr:>12.4f}")
+print(f"  {'SAE (Spectral, MST-matched k)':40s} {spectral_test_corr:>12.4f} {spectral_all_corr:>12.4f}")
+print(f"  {'SAE (Spectral, k-sweep)':40s} {spectral_sweep_test_corr:>12.4f} {spectral_sweep_all_corr:>12.4f}")
+print(f"  {'SIC code clusters':40s} {sic_test_corr:>12.4f} {sic_all_corr:>12.4f}")
+print(f"  {'Population mean':40s} {pop_corr:>12.4f} {pop_corr:>12.4f}")
 print("=" * 70)

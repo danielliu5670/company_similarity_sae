@@ -23,8 +23,8 @@ from tqdm import tqdm
 
 P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
-P.add_argument("--top-k", type=int, default=500,
-               help="Number of top-scoring features to retain")
+P.add_argument("--top-k", type=int, nargs="+", default=[500],
+               help="Number(s) of top-scoring features to retain (space-separated for sweep)")
 P.add_argument("--min-support", type=int, default=50,
                help="Minimum co-active pairs to score a feature")
 P.add_argument("--score-weight", action="store_true",
@@ -195,57 +195,7 @@ else:
                 support[j] = int(n)
 
 # ------------------------------------------------------------------
-# Select top-k features with positive scores
-# ------------------------------------------------------------------
-ranked = np.argsort(scores)[::-1]
-# Keep at most top_k, but only those with score > 0
-selected = ranked[:args.top_k]
-selected = selected[scores[selected] > 0]
-selected = np.sort(selected)  # sort by index for stable column ordering
-
-print(f"\nSelected {len(selected)} features (requested top {args.top_k})")
-if len(selected) == 0:
-    raise RuntimeError("No features scored positively. Check data or lower --min-support.")
-
-print(f"  Score range of selected: {scores[selected].min():.6f} to {scores[selected].max():.6f}")
-print(f"  Support range: {support[selected].min()} to {support[selected].max()} pairs")
-print(f"  Top 10 feature indices: {selected[np.argsort(scores[selected])[::-1]][:10]}")
-print(f"  Top 10 scores:          {np.sort(scores[selected])[::-1][:10]}")
-
-# Free the binary matrix
-del binary_matrix
-
-# ------------------------------------------------------------------
-# Scale selected features
-# ------------------------------------------------------------------
-print("Extracting selected features...")
-selected_features = feat_matrix[:, selected].copy()
-
-if args.score_weight:
-    weights = scores[selected].astype(np.float32)
-    selected_features *= weights[np.newaxis, :]
-    print(f"  Applied score-weighting (weight range: {weights.min():.6f} to {weights.max():.6f})")
-
-scaled_features = selected_features
-scaler = None
-
-# ------------------------------------------------------------------
-# Save model (selected indices + scaler + scores for interpretability)
-# ------------------------------------------------------------------
-model_bundle = {
-    "selected_indices": selected,
-    "scaler": scaler,
-    "scores": scores,
-    "support": support,
-    "pop_mean_train": pop_mean,
-    "train_years": sorted(train_years),
-    "test_years": sorted(test_years),
-}
-joblib.dump(model_bundle, args.out_model)
-print(f"Saved selection model to {args.out_model}")
-
-# ------------------------------------------------------------------
-# Match ALL pairs to feature indices (same logic as original)
+# Match all pairs to feature indices 
 # ------------------------------------------------------------------
 feat_df = pd.DataFrame({
     "__index_level_0__": company_ids,
@@ -253,83 +203,137 @@ feat_df = pd.DataFrame({
     "feat_idx": np.arange(len(df)),
 })
 
-print("Matching pairs to selected features...")
-pairs_df = pairs_df.merge(
+print("Matching pairs to feature indices...")
+pairs_merged = pairs_df.merge(
     feat_df.rename(columns={"__index_level_0__": "Company1", "feat_idx": "idx1"}),
     on=["Company1", "year"], how="inner",
 )
-pairs_df = pairs_df.merge(
+pairs_merged = pairs_merged.merge(
     feat_df.rename(columns={"__index_level_0__": "Company2", "feat_idx": "idx2"}),
     on=["Company2", "year"], how="inner",
 )
-print(f"  {len(pairs_df)} pairs have both companies with features")
+print(f"  {len(pairs_merged)} pairs have both companies with features")
 
-# ------------------------------------------------------------------
-# Compute cosine similarities in selected-feature space (batched)
-# ------------------------------------------------------------------
-print(f"Computing cosine similarities in {len(selected)}-D selected space...")
-norms = np.linalg.norm(scaled_features, axis=1).clip(min=1e-10)
-
-idx1 = pairs_df["idx1"].values
-idx2 = pairs_df["idx2"].values
-cos_sims = np.empty(len(pairs_df), dtype=np.float32)
-
-batch = 500_000
-for s in range(0, len(pairs_df), batch):
-    e = min(s + batch, len(pairs_df))
-    i1, i2 = idx1[s:e], idx2[s:e]
-    cos_sims[s:e] = (
-        (scaled_features[i1] * scaled_features[i2]).sum(1)
-        / (norms[i1] * norms[i2])
-    )
-
-pairs_df["cosine_similarity"] = cos_sims
-pairs_df = pairs_df.drop(columns=["idx1", "idx2"])
-
-# ------------------------------------------------------------------
-# Quick diagnostic: Spearman correlation
-# ------------------------------------------------------------------
 from scipy.stats import spearmanr
-correlations = pairs_df["correlation"].values
-rho, pval = spearmanr(cos_sims, correlations)
-print(f"\n  Spearman rho (similarity vs return correlation): {rho:.4f}  (p={pval:.2e})")
+
+idx1 = pairs_merged["idx1"].values
+idx2 = pairs_merged["idx2"].values
+correlations = pairs_merged["correlation"].values
 
 # ------------------------------------------------------------------
-# Precision-at-k evaluation
+# Sweep over top-k values
 # ------------------------------------------------------------------
-print("\n  Precision-at-k (mean return correlation of top-ranked pairs by similarity):")
-n_pairs_total = len(cos_sims)
-sorted_indices = np.argsort(cos_sims)[::-1]
+ranked = np.argsort(scores)[::-1]
+summary_rows = []
 
-for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
-    n_top = max(1, int(n_pairs_total * pct / 100.0))
-    top_idx = sorted_indices[:n_top]
-    top_mean_corr = correlations[top_idx].mean()
-    top_mean_sim = cos_sims[top_idx].mean()
-    print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): "
-          f"mean return corr = {top_mean_corr:.4f}  "
-          f"(mean sim = {top_mean_sim:.4f})")
+for top_k in args.top_k:
+    print(f"\n{'='*70}")
+    print(f"  top-k = {top_k}")
+    print(f"{'='*70}")
 
-test_mask = pairs_df["year"].isin(test_years).values
-test_sims = cos_sims[test_mask]
-test_corrs = correlations[test_mask]
-n_test = len(test_sims)
-test_sorted = np.argsort(test_sims)[::-1]
+    selected = ranked[:top_k]
+    selected = selected[scores[selected] > 0]
+    selected = np.sort(selected)
 
-print(f"\n  Precision-at-k (OOS test years only, {n_test:,d} pairs):")
-for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
-    n_top = max(1, int(n_test * pct / 100.0))
-    top_idx = test_sorted[:n_top]
-    top_mean_corr = test_corrs[top_idx].mean()
-    top_mean_sim = test_sims[top_idx].mean()
-    print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): "
-          f"mean return corr = {top_mean_corr:.4f}  "
-          f"(mean sim = {top_mean_sim:.4f})")
+    print(f"  Selected {len(selected)} features (requested {top_k})")
+    if len(selected) == 0:
+        print("  WARNING: No features scored positively, skipping.")
+        continue
+
+    print(f"  Score range: {scores[selected].min():.6f} to {scores[selected].max():.6f}")
+    print(f"  Top 10 feature indices: {selected[np.argsort(scores[selected])[::-1]][:10]}")
+    print(f"  Top 10 scores:          {np.sort(scores[selected])[::-1][:10]}")
+
+    # Extract and optionally score-weight
+    selected_features = feat_matrix[:, selected].copy()
+    if args.score_weight:
+        weights = scores[selected].astype(np.float32)
+        selected_features *= weights[np.newaxis, :]
+
+    norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10)
+
+    # Compute cosine similarities
+    cos_sims = np.empty(len(pairs_merged), dtype=np.float32)
+    batch = 500_000
+    for s in range(0, len(pairs_merged), batch):
+        e = min(s + batch, len(pairs_merged))
+        i1, i2 = idx1[s:e], idx2[s:e]
+        cos_sims[s:e] = (
+            (selected_features[i1] * selected_features[i2]).sum(1)
+            / (norms[i1] * norms[i2])
+        )
+
+    rho, pval = spearmanr(cos_sims, correlations)
+    print(f"\n  Spearman rho: {rho:.4f}  (p={pval:.2e})")
+
+    # Precision-at-k (all pairs)
+    print(f"\n  Precision-at-k (all pairs, {len(cos_sims):,d} total):")
+    sorted_indices = np.argsort(cos_sims)[::-1]
+    for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+        n_top = max(1, int(len(cos_sims) * pct / 100.0))
+        top_idx = sorted_indices[:n_top]
+        top_mean_corr = correlations[top_idx].mean()
+        print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
+
+    # Precision-at-k (OOS only)
+    test_mask = pairs_merged["year"].isin(test_years).values
+    test_sims = cos_sims[test_mask]
+    test_corrs = correlations[test_mask]
+    test_sorted = np.argsort(test_sims)[::-1]
+
+    oos_top1_corr = np.nan
+    print(f"\n  Precision-at-k (OOS test years, {len(test_sims):,d} pairs):")
+    for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+        n_top = max(1, int(len(test_sims) * pct / 100.0))
+        top_idx = test_sorted[:n_top]
+        top_mean_corr = test_corrs[top_idx].mean()
+        print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
+        if pct == 1.0:
+            oos_top1_corr = top_mean_corr
+
+    summary_rows.append({
+        "top_k": top_k, "n_selected": len(selected),
+        "spearman_rho": rho, "oos_top1pct_corr": oos_top1_corr,
+    })
+
+    # Save pairs for this k
+    out_pairs_df = pairs_merged.drop(columns=["idx1", "idx2"]).copy()
+    out_pairs_df["cosine_similarity"] = cos_sims
+
+    if len(args.top_k) == 1:
+        out_path = args.out_pairs
+    else:
+        base, ext = os.path.splitext(args.out_pairs)
+        out_path = f"{base}_k{top_k}{ext}"
+
+    out_pairs_df.to_pickle(out_path)
+    print(f"  Saved {len(out_pairs_df)} pairs to {out_path}")
 
 # ------------------------------------------------------------------
-# Save pairs
+# Save model (scores array for future --load-model runs)
 # ------------------------------------------------------------------
-pairs_df.to_pickle(args.out_pairs)
-print(f"\nSaved {len(pairs_df)} pairs to {args.out_pairs}")
-print(f"  Mean cosine similarity: {cos_sims.mean():.4f}")
-print(f"  Mean stock correlation:  {pairs_df['correlation'].mean():.4f}")
+model_bundle = {
+    "selected_indices": selected,
+    "scaler": None,
+    "scores": scores,
+    "support": support,
+    "pop_mean_train": pop_mean,
+    "train_years": sorted(train_years),
+    "test_years": sorted(test_years),
+    "score_weighted": args.score_weight,
+    "top_k_used": len(selected),
+}
+joblib.dump(model_bundle, args.out_model)
+print(f"\nSaved selection model to {args.out_model}")
+
+# ------------------------------------------------------------------
+# Summary table (only printed when sweeping multiple k values)
+# ------------------------------------------------------------------
+if len(summary_rows) > 1:
+    print(f"\n{'='*70}")
+    print("K-SWEEP SUMMARY")
+    print(f"{'='*70}")
+    print(f"  {'top_k':>8s}  {'n_sel':>6s}  {'rho':>8s}  {'OOS top1%':>10s}")
+    for r in summary_rows:
+        print(f"  {r['top_k']:>8d}  {r['n_selected']:>6d}  {r['spearman_rho']:>8.4f}  {r['oos_top1pct_corr']:>10.4f}")
+    print(f"{'='*70}")
