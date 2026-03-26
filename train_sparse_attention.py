@@ -212,18 +212,34 @@ def main():
     df_feat["year"] = df_feat["year"].astype(int)
     df_feat = df_feat.reset_index(drop=True)
 
-    feat_matrix = np.vstack(df_feat["features"].values)
-    feat_scaler = StandardScaler().fit(feat_matrix)
     pca_loaded = joblib.load(args.pca_model)
-    pca = pca_loaded["pca"] if isinstance(pca_loaded, dict) else pca_loaded
+    if isinstance(pca_loaded, dict):
+        pca = pca_loaded["pca"]
+        feat_scaler = pca_loaded["scaler"]
+    else:
+        pca = pca_loaded
+        feat_matrix_tmp = np.vstack(df_feat["features"].values)
+        feat_scaler = StandardScaler().fit(feat_matrix_tmp)
+        del feat_matrix_tmp
+        gc.collect()
 
-    pca_features = (feat_scaler.transform(feat_matrix) @ pca.components_.T).astype(
-        np.float16
-    )
-    dim = pca_features.shape[1]
-    print(f"  PCA features: {pca_features.shape}")
-    del feat_matrix
+    components_T = pca.components_.T.astype(np.float32)
+    dim = components_T.shape[1]
+    n_rows = len(df_feat)
+    pca_features = np.empty((n_rows, dim), dtype=np.float16)
+
+    chunk_size = 1000
+    print(f"  Projecting {n_rows} rows to {dim} PCA dims in chunks of {chunk_size}...")
+    for start in range(0, n_rows, chunk_size):
+        end = min(start + chunk_size, n_rows)
+        chunk_raw = np.vstack(df_feat["features"].values[start:end]).astype(np.float32)
+        chunk_scaled = (chunk_raw - feat_scaler.mean_) / feat_scaler.scale_
+        pca_features[start:end] = (chunk_scaled @ components_T).astype(np.float16)
+        del chunk_raw, chunk_scaled
+
+    del components_T
     gc.collect()
+    print(f"  PCA features: {pca_features.shape}")
 
     # ------------------------------------------------------------------
     # Map pairs to PCA indices
