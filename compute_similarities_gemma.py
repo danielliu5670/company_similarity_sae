@@ -27,6 +27,10 @@ P.add_argument("--top-k", type=int, default=500,
                help="Number of top-scoring features to retain")
 P.add_argument("--min-support", type=int, default=50,
                help="Minimum co-active pairs to score a feature")
+P.add_argument("--score-weight", action="store_true",
+               help="Multiply each selected feature by its score before cosine sim")
+P.add_argument("--load-model", default=None,
+               help="Load pre-computed scores from this model file; skip scoring loop")
 P.add_argument(
     "--cov-ds",
     default=(
@@ -144,41 +148,51 @@ pop_mean = corr_train.mean()
 print(f"  {len(train_pairs)} training pairs (population mean corr: {pop_mean:.4f})")
 
 # ------------------------------------------------------------------
-# Binarize features: active = nonzero after JumpReLU
+# Feature scoring: either load pre-computed or run from scratch
 # ------------------------------------------------------------------
-print("Binarizing feature matrix...")
-binary_matrix = (feat_matrix > 0)  # bool, ~1.6 GB for 24K x 65K
+if args.load_model is not None:
+    print(f"\nLoading pre-computed scores from {args.load_model}...")
+    saved = joblib.load(args.load_model)
+    scores = saved["scores"]
+    support = saved["support"]
+    print(f"  Loaded scores for {len(scores)} features")
+else:
+    # ------------------------------------------------------------------
+    # Binarize features: active = nonzero after JumpReLU
+    # ------------------------------------------------------------------
+    print("Binarizing feature matrix...")
+    binary_matrix = (feat_matrix > 0)  # bool, ~1.6 GB for 24K x 65K
 
-# ------------------------------------------------------------------
-# Score each feature against return correlations
-# ------------------------------------------------------------------
-print(f"Scoring {feat_dim} features (min support = {args.min_support} pairs)...")
-scores = np.zeros(feat_dim, dtype=np.float64)
-support = np.zeros(feat_dim, dtype=np.int64)
+    # ------------------------------------------------------------------
+    # Score each feature against return correlations
+    # ------------------------------------------------------------------
+    print(f"Scoring {feat_dim} features (min support = {args.min_support} pairs)...")
+    scores = np.zeros(feat_dim, dtype=np.float64)
+    support = np.zeros(feat_dim, dtype=np.int64)
 
-chunk_size = 128
-n_chunks = (feat_dim + chunk_size - 1) // chunk_size
+    chunk_size = 128
+    n_chunks = (feat_dim + chunk_size - 1) // chunk_size
 
-for ci in tqdm(range(n_chunks), desc="Scoring features (chunked)"):
-    j_start = ci * chunk_size
-    j_end = min(j_start + chunk_size, feat_dim)
+    for ci in tqdm(range(n_chunks), desc="Scoring features (chunked)"):
+        j_start = ci * chunk_size
+        j_end = min(j_start + chunk_size, feat_dim)
 
-    cols = binary_matrix[:, j_start:j_end]        # (n_companies, chunk) bool
-    b1 = cols[idx1_train]                          # (n_pairs, chunk) bool
-    b2 = cols[idx2_train]                          # (n_pairs, chunk) bool
-    co = b1 & b2
-    del b1, b2
+        cols = binary_matrix[:, j_start:j_end]        # (n_companies, chunk) bool
+        b1 = cols[idx1_train]                          # (n_pairs, chunk) bool
+        b2 = cols[idx2_train]                          # (n_pairs, chunk) bool
+        co = b1 & b2
+        del b1, b2
 
-    counts = co.sum(axis=0)                        # (chunk,)
-    corr_sums = corr_train @ co.astype(np.float32) # (chunk,)
-    del co
+        counts = co.sum(axis=0)                        # (chunk,)
+        corr_sums = corr_train @ co.astype(np.float32) # (chunk,)
+        del co
 
-    for local_j in range(j_end - j_start):
-        j = j_start + local_j
-        n = counts[local_j]
-        if n >= args.min_support:
-            scores[j] = corr_sums[local_j] / n - pop_mean
-            support[j] = int(n)
+        for local_j in range(j_end - j_start):
+            j = j_start + local_j
+            n = counts[local_j]
+            if n >= args.min_support:
+                scores[j] = corr_sums[local_j] / n - pop_mean
+                support[j] = int(n)
 
 # ------------------------------------------------------------------
 # Select top-k features with positive scores
@@ -205,7 +219,13 @@ del binary_matrix
 # Scale selected features
 # ------------------------------------------------------------------
 print("Extracting selected features...")
-selected_features = feat_matrix[:, selected]
+selected_features = feat_matrix[:, selected].copy()
+
+if args.score_weight:
+    weights = scores[selected].astype(np.float32)
+    selected_features *= weights[np.newaxis, :]
+    print(f"  Applied score-weighting (weight range: {weights.min():.6f} to {weights.max():.6f})")
+
 scaled_features = selected_features
 scaler = None
 
@@ -270,8 +290,41 @@ pairs_df = pairs_df.drop(columns=["idx1", "idx2"])
 # Quick diagnostic: Spearman correlation
 # ------------------------------------------------------------------
 from scipy.stats import spearmanr
-rho, pval = spearmanr(cos_sims, pairs_df["correlation"].values)
+correlations = pairs_df["correlation"].values
+rho, pval = spearmanr(cos_sims, correlations)
 print(f"\n  Spearman rho (similarity vs return correlation): {rho:.4f}  (p={pval:.2e})")
+
+# ------------------------------------------------------------------
+# Precision-at-k evaluation
+# ------------------------------------------------------------------
+print("\n  Precision-at-k (mean return correlation of top-ranked pairs by similarity):")
+n_pairs_total = len(cos_sims)
+sorted_indices = np.argsort(cos_sims)[::-1]
+
+for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+    n_top = max(1, int(n_pairs_total * pct / 100.0))
+    top_idx = sorted_indices[:n_top]
+    top_mean_corr = correlations[top_idx].mean()
+    top_mean_sim = cos_sims[top_idx].mean()
+    print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): "
+          f"mean return corr = {top_mean_corr:.4f}  "
+          f"(mean sim = {top_mean_sim:.4f})")
+
+test_mask = pairs_df["year"].isin(test_years).values
+test_sims = cos_sims[test_mask]
+test_corrs = correlations[test_mask]
+n_test = len(test_sims)
+test_sorted = np.argsort(test_sims)[::-1]
+
+print(f"\n  Precision-at-k (OOS test years only, {n_test:,d} pairs):")
+for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+    n_top = max(1, int(n_test * pct / 100.0))
+    top_idx = test_sorted[:n_top]
+    top_mean_corr = test_corrs[top_idx].mean()
+    top_mean_sim = test_sims[top_idx].mean()
+    print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): "
+          f"mean return corr = {top_mean_corr:.4f}  "
+          f"(mean sim = {top_mean_sim:.4f})")
 
 # ------------------------------------------------------------------
 # Save pairs
