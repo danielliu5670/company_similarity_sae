@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import joblib
 from datasets import load_dataset
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScale
+from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
 
@@ -161,40 +162,46 @@ else:
     # Score each feature: Pearson correlation between activation
     # products and return correlations (continuous scoring)
     # ------------------------------------------------------------------
-    print(f"Scoring {feat_dim} features (continuous, min support = {args.min_support} pairs)...")
-    scores = np.zeros(feat_dim, dtype=np.float64)
-    support = np.zeros(feat_dim, dtype=np.int64)
+    print("Scoring features via sparse matrix formulation...")
+
+    n = len(feat_matrix)
+    n_pairs = len(idx1_train)
 
     corr_mean = float(corr_train.mean())
     corr_centered = (corr_train - corr_mean).astype(np.float32)
     corr_ss = float(np.sqrt((corr_centered.astype(np.float64) ** 2).sum()))
 
-    chunk_size = 128
-    n_chunks = (feat_dim + chunk_size - 1) // chunk_size
+    W = csr_matrix(
+        (corr_centered, (idx1_train, idx2_train)), shape=(n, n)
+    )
+    W1 = csr_matrix(
+        (np.ones(n_pairs, dtype=np.float32), (idx1_train, idx2_train)), shape=(n, n)
+    )
 
-    for ci in tqdm(range(n_chunks), desc="Scoring features (continuous)"):
-        j_start = ci * chunk_size
-        j_end = min(j_start + chunk_size, feat_dim)
+    F = feat_matrix
+    B = (F > 0).astype(np.float32)
+    counts = np.asarray(((W1 @ B) * B).sum(axis=0)).ravel()
+    del B
 
-        cols = feat_matrix[:, j_start:j_end]
-        v1 = cols[idx1_train]
-        v2 = cols[idx2_train]
+    WF = W @ F
+    numerators = np.asarray((WF * F).sum(axis=0)).ravel().astype(np.float64)
+    del WF
 
-        counts = ((v1 > 0) & (v2 > 0)).sum(axis=0)
+    W1F = W1 @ F
+    sum_prods = np.asarray((W1F * F).sum(axis=0)).ravel().astype(np.float64)
+    del W1F
 
-        products = v1 * v2
-        del v1, v2
+    F2 = F ** 2
+    W1F2 = W1 @ F2
+    sum_prod_sq = np.asarray((W1F2 * F2).sum(axis=0)).ravel().astype(np.float64)
+    del W1F2, F2
 
-        prod_means = products.mean(axis=0)
-        products -= prod_means[np.newaxis, :]
-        prod_ss = np.sqrt((products ** 2).sum(axis=0))
+    prod_means = sum_prods / n_pairs
+    prod_ss = np.sqrt(np.maximum(sum_prod_sq - n_pairs * prod_means ** 2, 0.0))
 
-        numerators = corr_centered @ products
-        del products
-
-        valid = (counts >= args.min_support) & (prod_ss > 1e-10)
-        scores[j_start:j_end] = np.where(valid, numerators / (prod_ss * corr_ss), 0.0)
-        support[j_start:j_end] = np.where(valid, counts, 0)
+    valid = (counts >= args.min_support) & (prod_ss > 1e-10)
+    scores = np.where(valid, numerators / (prod_ss * corr_ss), 0.0)
+    support = np.where(valid, counts, 0).astype(np.int64)
 
 # ------------------------------------------------------------------
 # Match all pairs to feature indices 
