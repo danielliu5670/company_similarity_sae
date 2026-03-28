@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from datasets import load_dataset
-from sklearn.preprocessing import StandardScale
+from sklearn.preprocessing import StandardScaler
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
