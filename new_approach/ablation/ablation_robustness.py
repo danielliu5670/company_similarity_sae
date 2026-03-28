@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Robustness checks for the supervised SAE approach:
+Robustness checks for supervised SAE approach (GPU-accelerated):
   1. Exclude 2020 from OOS evaluation (COVID-19 correlation spike)
-  2. Norm residualization (separate content signal from magnitude signal)
+  2. Norm residualization (separate content signal from magnitude)
+  3. Per-year OOS breakdown
 
 Usage (Colab):
+    !pip install cupy-cuda12x tabulate
     !python ablation_robustness.py \
         --features-pkl /content/drive/MyDrive/company_similarity_sae/data/llama_features.pkl \
         --load-model /content/drive/MyDrive/company_similarity_sae/data/llama_selection_model.pkl \
@@ -14,10 +16,12 @@ Usage (Colab):
 import argparse
 import numpy as np
 import pandas as pd
+import cupy as cp
 import joblib
 from datasets import load_dataset
 from scipy.stats import spearmanr
 from tabulate import tabulate
+from tqdm import tqdm
 import gc
 
 def unwrap_feature(x):
@@ -32,6 +36,7 @@ P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
 P.add_argument("--load-model", required=True)
 P.add_argument("--top-k", type=int, default=1250)
+P.add_argument("--pair-batch", type=int, default=500_000)
 P.add_argument(
     "--cov-ds",
     default=(
@@ -76,11 +81,10 @@ selected = np.sort(selected)
 n_selected = len(selected)
 print(f"  Selected {n_selected} features")
 
-selected_features = feat_matrix[:, selected].copy()
+selected_features = feat_matrix[:, selected].copy().astype(np.float32)
 weights = scores[selected].astype(np.float32)
 selected_features *= weights[np.newaxis, :]
 
-# Norms of the score-weighted selected features (for residualization)
 feat_norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10).astype(np.float32)
 
 del feat_matrix; gc.collect()
@@ -116,38 +120,41 @@ pairs_merged = pairs_merged.merge(
     on=["Company2", "year"], how="inner",
 )
 
-idx1 = pairs_merged["idx1"].values
-idx2 = pairs_merged["idx2"].values
+idx1 = pairs_merged["idx1"].values.astype(np.int64)
+idx2 = pairs_merged["idx2"].values.astype(np.int64)
 correlations = pairs_merged["correlation"].values.astype(np.float32)
+n_pairs = len(pairs_merged)
 
-# ---- Compute similarities (dot product, alpha=0) ----
-print("Computing similarities...")
-sims = np.empty(len(pairs_merged), dtype=np.float32)
-batch = 500_000
-for s in range(0, len(pairs_merged), batch):
-    e = min(s + batch, len(pairs_merged))
-    i1, i2 = idx1[s:e], idx2[s:e]
-    sims[s:e] = (selected_features[i1] * selected_features[i2]).sum(1)
+# ---- Compute similarities on GPU (dot product, alpha=0) ----
+print("Computing similarities on GPU...")
+sel_gpu = cp.asarray(selected_features)
+idx1_gpu = cp.asarray(idx1)
+idx2_gpu = cp.asarray(idx2)
+sims = np.empty(n_pairs, dtype=np.float32)
+
+pair_batch = args.pair_batch
+for s in tqdm(range(0, n_pairs, pair_batch), desc="Dot products (GPU)",
+              total=(n_pairs + pair_batch - 1) // pair_batch):
+    e = min(s + pair_batch, n_pairs)
+    a = sel_gpu[idx1_gpu[s:e]]
+    b = sel_gpu[idx2_gpu[s:e]]
+    sims[s:e] = cp.asnumpy((a * b).sum(axis=1))
+    del a, b
+
+del sel_gpu, idx1_gpu, idx2_gpu
+cp.get_default_memory_pool().free_all_blocks()
 
 # ---- Evaluation helper ----
-def evaluate(sim_values, corr_values, label, year_mask=None):
-    """Evaluate on a subset defined by year_mask (boolean array over sim_values)."""
-    if year_mask is not None:
-        s = sim_values[year_mask]
-        c = corr_values[year_mask]
-    else:
-        s = sim_values
-        c = corr_values
+def evaluate(sim_values, corr_values, label):
+    rho, pval = spearmanr(sim_values, corr_values)
+    sorted_idx = np.argsort(sim_values)[::-1]
 
-    rho, pval = spearmanr(s, c)
-    sorted_idx = np.argsort(s)[::-1]
-
-    print(f"\n--- {label} ({len(s):,d} pairs) ---")
+    print(f"\n--- {label} ({len(sim_values):,d} pairs) ---")
     print(f"Spearman rho: {rho:.4f} (p={pval:.2e})")
     rows = []
     for pct in PCTS:
-        n_top = max(1, int(len(s) * pct / 100.0))
-        top_mean = c[sorted_idx[:n_top]].mean()
+        n_top = max(1, int(len(sim_values) * pct / 100.0))
+        top_mean = corr_values[sorted_idx[:n_top]].mean()
         rows.append([f"top {pct:.1f}%", f"{top_mean:.4f}"])
     print(tabulate(rows, headers=["Cutoff", "Mean return corr"],
                    tablefmt="simple_outline"))
@@ -171,12 +178,14 @@ print(f"\n  2020 pairs: {n_2020:,d} out of {n_test:,d} OOS pairs "
 print(f"  Mean return corr in 2020 pairs: {correlations[mask_2020_only].mean():.4f}")
 print(f"  Mean return corr in non-2020 OOS: {correlations[test_mask_no2020].mean():.4f}")
 
-evaluate(sims, correlations, "OOS with 2020 (baseline)", test_mask_full)
-evaluate(sims, correlations, "OOS without 2020", test_mask_no2020)
+evaluate(sims[test_mask_full], correlations[test_mask_full],
+         "OOS with 2020 (baseline)")
+evaluate(sims[test_mask_no2020], correlations[test_mask_no2020],
+         "OOS without 2020")
 
 # Per-year breakdown
 print("\n  Per-year OOS breakdown:")
-print(f"  {'Year':>6s}  {'Pairs':>10s}  {'Spearman':>10s}  {'Top 1%':>10s}  {'Mean corr':>10s}")
+print(f"  {'Year':>6s}  {'Pairs':>10s}  {'Spearman':>10s}  {'Top 1%':>10s}  {'Pop corr':>10s}")
 for year in sorted(test_years):
     ymask = pairs_merged["year"].eq(year).values
     if ymask.sum() < 100:
@@ -196,36 +205,26 @@ print(f"\n{'='*70}")
 print("CHECK 2: NORM RESIDUALIZATION")
 print(f"{'='*70}")
 
-# For each pair, compute the product of both companies' norms
 norm_products = feat_norms[idx1] * feat_norms[idx2]
 
-print(f"\n  Correlation between dot product sim and norm product: "
+print(f"\n  Corr(dot_product_sim, norm_product): "
       f"{np.corrcoef(sims, norm_products)[0,1]:.4f}")
 
-# OLS: sims = a * norm_products + b + residual
-# Using only test pairs for the regression (to avoid any train contamination)
+# OLS on test set: sims = slope * norm_products + intercept + residual
 test_sims = sims[test_mask_full]
 test_corrs = correlations[test_mask_full]
 test_norm_prods = norm_products[test_mask_full]
 
-# Fit OLS on test set
-X = test_norm_prods
-Y = test_sims
-slope = np.cov(X, Y)[0, 1] / np.var(X)
-intercept = Y.mean() - slope * X.mean()
-residuals_test = Y - (slope * X + intercept)
+slope = np.cov(test_norm_prods, test_sims)[0, 1] / np.var(test_norm_prods)
+intercept = test_sims.mean() - slope * test_norm_prods.mean()
+residuals_test = test_sims - (slope * test_norm_prods + intercept)
+r_squared = 1 - np.var(residuals_test) / np.var(test_sims)
 
 print(f"  OLS: sim = {slope:.6f} * norm_product + {intercept:.6f}")
-print(f"  R^2 of norm product on similarity: "
-      f"{1 - np.var(residuals_test)/np.var(test_sims):.4f}")
+print(f"  R^2 of norm product on similarity: {r_squared:.4f}")
 
 evaluate(test_sims, test_corrs, "OOS raw dot product (baseline)")
 evaluate(residuals_test, test_corrs, "OOS after norm residualization")
-
-# Also residualize on all pairs and evaluate
-all_residuals = sims - (slope * norm_products + intercept)
-evaluate(all_residuals, correlations, "All years after norm residualization",
-         test_mask_full)
 
 print(f"\n{'='*70}")
 print("INTERPRETATION:")

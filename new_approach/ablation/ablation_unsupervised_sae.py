@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-Ablation: unsupervised SAE baseline (all features, no selection).
+Ablation: unsupervised SAE baseline (all features, no selection). GPU-accelerated.
 Tests whether the raw SAE representation outperforms PCA even without supervision.
 
-Computes pairwise dot product and cosine similarity over all ~131K SAE features.
-No scoring, no selection, no weighting.
+Strategy: feat_matrix (27K x 131K) does not fit on GPU.
+  - Outer loop: chunk over features (4096 at a time, ~454 MB per chunk)
+  - Inner loop: batch over pairs (100K at a time)
+  - Accumulate partial dot products on GPU.
 
-Usage (Colab):
+Usage (Colab with GPU runtime + High RAM):
+    !pip install cupy-cuda12x tabulate
     !python ablation_unsupervised_sae.py \
         --features-pkl /content/drive/MyDrive/company_similarity_sae/data/llama_features.pkl
-
-IMPORTANT: Requires ~16-18 GB RAM. Use Colab Pro with High RAM runtime.
-The computation over 131K features x 15M pairs takes ~15-30 minutes.
 """
 
 import argparse
 import numpy as np
 import pandas as pd
+import cupy as cp
 from datasets import load_dataset
 from scipy.stats import spearmanr
 from tabulate import tabulate
+from tqdm import tqdm
 import gc
 import time
 
@@ -33,10 +35,10 @@ def unwrap_feature(x):
 
 P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
-P.add_argument("--pair-batch", type=int, default=50_000,
-               help="Pairs per batch (reduce if OOM)")
-P.add_argument("--feat-chunk", type=int, default=4000,
-               help="Features per chunk (reduce if OOM)")
+P.add_argument("--feat-chunk", type=int, default=4096,
+               help="Features per GPU chunk (reduce to 2048 if OOM)")
+P.add_argument("--pair-batch", type=int, default=100_000,
+               help="Pairs per GPU batch (reduce to 50000 if OOM)")
 P.add_argument(
     "--cov-ds",
     default=(
@@ -72,15 +74,15 @@ if nan_mask.sum() > 0:
     feat_matrix = feat_matrix[~nan_mask]
 
 n_companies, feat_dim = feat_matrix.shape
-print(f"  Feature matrix: {n_companies} companies x {feat_dim} features")
-print(f"  Memory: ~{feat_matrix.nbytes / 1e9:.1f} GB")
+print(f"  Feature matrix: {n_companies} x {feat_dim}")
+print(f"  RAM usage: ~{feat_matrix.nbytes / 1e9:.1f} GB")
 
-# ---- Precompute norms ----
+# Precompute norms on CPU (just a 1D array)
 print("Computing L2 norms...")
 norms = np.linalg.norm(feat_matrix, axis=1).astype(np.float32)
 norms = np.clip(norms, 1e-10, None)
-print(f"  Norm range: {norms.min():.2f} to {norms.max():.2f}")
-print(f"  Median norm: {np.median(norms):.2f}")
+print(f"  Norm range: {norms.min():.2f} to {norms.max():.2f}, "
+      f"median: {np.median(norms):.2f}")
 
 # ---- Load pairs ----
 print("\nLoading pairs...")
@@ -112,48 +114,62 @@ pairs_merged = pairs_merged.merge(
     on=["Company2", "year"], how="inner",
 )
 
-idx1 = pairs_merged["idx1"].values
-idx2 = pairs_merged["idx2"].values
+idx1 = pairs_merged["idx1"].values.astype(np.int64)
+idx2 = pairs_merged["idx2"].values.astype(np.int64)
 correlations = pairs_merged["correlation"].values.astype(np.float32)
 n_pairs = len(pairs_merged)
 print(f"  {n_pairs:,d} matched pairs")
 
-# ---- Compute dot products (chunked over both pairs and features) ----
-print(f"\nComputing dot products over all {feat_dim} features...")
-print(f"  pair_batch={args.pair_batch}, feat_chunk={args.feat_chunk}")
+# ==================================================================
+# Compute dot products: double-chunked over features and pairs.
+#
+# dot(a,b) = sum_j feat[a,j] * feat[b,j]
+#
+# Outer loop: load feat_matrix[:, j_start:j_end] to GPU once.
+# Inner loop: for each pair batch, index into the chunk and accumulate.
+# Dot products accumulate on GPU to avoid CPU-GPU transfers per batch.
+# ==================================================================
+print(f"\nComputing dot products on GPU...")
+print(f"  feat_chunk={args.feat_chunk}, pair_batch={args.pair_batch}")
 t0 = time.time()
 
-dot_sims = np.zeros(n_pairs, dtype=np.float64)
-pair_batch = args.pair_batch
+idx1_gpu = cp.asarray(idx1)
+idx2_gpu = cp.asarray(idx2)
+dot_sims_gpu = cp.zeros(n_pairs, dtype=cp.float32)
+
 feat_chunk = args.feat_chunk
+pair_batch = args.pair_batch
+n_feat_chunks = (feat_dim + feat_chunk - 1) // feat_chunk
 n_pair_batches = (n_pairs + pair_batch - 1) // pair_batch
 
-for bi, s in enumerate(range(0, n_pairs, pair_batch)):
-    e = min(s + pair_batch, n_pairs)
-    i1, i2 = idx1[s:e], idx2[s:e]
-    batch_dot = np.zeros(e - s, dtype=np.float64)
+for fi in tqdm(range(n_feat_chunks), desc="Feature chunks"):
+    fs = fi * feat_chunk
+    fe = min(fs + feat_chunk, feat_dim)
 
-    for fs in range(0, feat_dim, feat_chunk):
-        fe = min(fs + feat_chunk, feat_dim)
-        a = feat_matrix[i1, fs:fe]
-        b = feat_matrix[i2, fs:fe]
-        batch_dot += (a.astype(np.float64) * b.astype(np.float64)).sum(axis=1)
+    feat_gpu = cp.asarray(feat_matrix[:, fs:fe])
 
-    dot_sims[s:e] = batch_dot
+    for s in range(0, n_pairs, pair_batch):
+        e = min(s + pair_batch, n_pairs)
+        a = feat_gpu[idx1_gpu[s:e]]
+        b = feat_gpu[idx2_gpu[s:e]]
+        dot_sims_gpu[s:e] += (a * b).sum(axis=1)
+        del a, b
 
-    if (bi + 1) % 20 == 0 or bi == 0:
-        elapsed = time.time() - t0
-        rate = (bi + 1) / elapsed
-        remaining = (n_pair_batches - bi - 1) / rate
-        print(f"  Batch {bi+1}/{n_pair_batches} "
-              f"({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)")
+    del feat_gpu
+    cp.get_default_memory_pool().free_all_blocks()
 
-dot_sims = dot_sims.astype(np.float32)
+dot_sims = cp.asnumpy(dot_sims_gpu)
+del dot_sims_gpu
+cp.get_default_memory_pool().free_all_blocks()
+
 elapsed = time.time() - t0
 print(f"  Done in {elapsed:.1f}s")
 
-# ---- Cosine similarity = dot / (norm1 * norm2) ----
+# Cosine = dot / (norm1 * norm2)
 cos_sims = dot_sims / (norms[idx1] * norms[idx2])
+
+del idx1_gpu, idx2_gpu
+cp.get_default_memory_pool().free_all_blocks()
 
 # ---- Evaluation helper ----
 def evaluate(sims, label):
@@ -186,7 +202,7 @@ print(f"\nPopulation mean: {correlations.mean():.4f}")
 
 print(f"\n{'='*60}")
 print("COMPARE:")
-print("  Your SAE supervised (k=1250, α=0):  Spearman=0.1826, top-1%=0.3762")
-print("  Parent paper PCA cosine:             Spearman=0.0217, top-1%=0.1598")
-print("  SIC baseline:                                         top-1%=0.2835")
+print("  SAE supervised (k=1250, a=0):  Spearman=0.1826, top-1%=0.3762")
+print("  Parent paper PCA cosine:       Spearman=0.0217, top-1%=0.1598")
+print("  SIC baseline:                                    top-1%=0.2835")
 print(f"{'='*60}")
