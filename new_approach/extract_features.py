@@ -158,41 +158,45 @@ if args.load_model is not None:
     print(f"  Loaded scores for {len(scores)} features")
 else:
     # ------------------------------------------------------------------
-    # Binarize features: active = nonzero after JumpReLU
+    # Score each feature: Pearson correlation between activation
+    # products and return correlations (continuous scoring)
     # ------------------------------------------------------------------
-    print("Binarizing feature matrix...")
-    binary_matrix = (feat_matrix > 0)  # bool, ~1.6 GB for 24K x 65K
-
-    # ------------------------------------------------------------------
-    # Score each feature against return correlations
-    # ------------------------------------------------------------------
-    print(f"Scoring {feat_dim} features (min support = {args.min_support} pairs)...")
+    print(f"Scoring {feat_dim} features (continuous, min support = {args.min_support} pairs)...")
     scores = np.zeros(feat_dim, dtype=np.float64)
     support = np.zeros(feat_dim, dtype=np.int64)
 
-    chunk_size = 128
+    corr_mean = float(corr_train.mean())
+    corr_centered = (corr_train - corr_mean).astype(np.float64)
+    corr_ss = np.sqrt((corr_centered ** 2).sum())
+
+    chunk_size = 64
     n_chunks = (feat_dim + chunk_size - 1) // chunk_size
 
-    for ci in tqdm(range(n_chunks), desc="Scoring features (chunked)"):
+    for ci in tqdm(range(n_chunks), desc="Scoring features (continuous)"):
         j_start = ci * chunk_size
         j_end = min(j_start + chunk_size, feat_dim)
 
-        cols = binary_matrix[:, j_start:j_end]        # (n_companies, chunk) bool
-        b1 = cols[idx1_train]                          # (n_pairs, chunk) bool
-        b2 = cols[idx2_train]                          # (n_pairs, chunk) bool
-        co = b1 & b2
-        del b1, b2
+        cols = feat_matrix[:, j_start:j_end]
+        v1 = cols[idx1_train]                            # (n_pairs, chunk) float32
+        v2 = cols[idx2_train]                            # (n_pairs, chunk) float32
 
-        counts = co.sum(axis=0)                        # (chunk,)
-        corr_sums = corr_train @ co.astype(np.float32) # (chunk,)
-        del co
+        counts = ((v1 > 0) & (v2 > 0)).sum(axis=0)      # (chunk,)
+
+        products = (v1 * v2).astype(np.float32)          # (n_pairs, chunk)
+        del v1, v2
+
+        prod_means = products.mean(axis=0)               # (chunk,)
+        products -= prod_means[np.newaxis, :]
+        prod_ss = np.sqrt((products.astype(np.float64) ** 2).sum(axis=0))  # (chunk,)
+
+        numerators = corr_centered @ products.astype(np.float64)           # (chunk,)
+        del products
 
         for local_j in range(j_end - j_start):
             j = j_start + local_j
-            n = counts[local_j]
-            if n >= args.min_support:
-                scores[j] = corr_sums[local_j] / n - pop_mean
-                support[j] = int(n)
+            if counts[local_j] >= args.min_support and prod_ss[local_j] > 1e-10:
+                scores[j] = numerators[local_j] / (prod_ss[local_j] * corr_ss)
+                support[j] = int(counts[local_j])
 
 # ------------------------------------------------------------------
 # Match all pairs to feature indices 
