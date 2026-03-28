@@ -18,7 +18,6 @@ import pandas as pd
 import joblib
 from datasets import load_dataset
 from sklearn.preprocessing import StandardScaler
-from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
 
@@ -159,49 +158,41 @@ if args.load_model is not None:
     print(f"  Loaded scores for {len(scores)} features")
 else:
     # ------------------------------------------------------------------
-    # Score each feature: Pearson correlation between activation
-    # products and return correlations (continuous scoring)
+    # Binarize features: active = nonzero after JumpReLU
     # ------------------------------------------------------------------
-    print("Scoring features via sparse matrix formulation...")
+    print("Binarizing feature matrix...")
+    binary_matrix = (feat_matrix > 0)  # bool, ~1.6 GB for 24K x 65K
 
-    n = len(feat_matrix)
-    n_pairs = len(idx1_train)
+    # ------------------------------------------------------------------
+    # Score each feature against return correlations
+    # ------------------------------------------------------------------
+    print(f"Scoring {feat_dim} features (min support = {args.min_support} pairs)...")
+    scores = np.zeros(feat_dim, dtype=np.float64)
+    support = np.zeros(feat_dim, dtype=np.int64)
 
-    corr_mean = float(corr_train.mean())
-    corr_centered = (corr_train - corr_mean).astype(np.float32)
-    corr_ss = float(np.sqrt((corr_centered.astype(np.float64) ** 2).sum()))
+    chunk_size = 128
+    n_chunks = (feat_dim + chunk_size - 1) // chunk_size
 
-    W = csr_matrix(
-        (corr_centered, (idx1_train, idx2_train)), shape=(n, n)
-    )
-    W1 = csr_matrix(
-        (np.ones(n_pairs, dtype=np.float32), (idx1_train, idx2_train)), shape=(n, n)
-    )
+    for ci in tqdm(range(n_chunks), desc="Scoring features (chunked)"):
+        j_start = ci * chunk_size
+        j_end = min(j_start + chunk_size, feat_dim)
 
-    F = feat_matrix
-    B = (F > 0).astype(np.float32)
-    counts = np.asarray(((W1 @ B) * B).sum(axis=0)).ravel()
-    del B
+        cols = binary_matrix[:, j_start:j_end]        # (n_companies, chunk) bool
+        b1 = cols[idx1_train]                          # (n_pairs, chunk) bool
+        b2 = cols[idx2_train]                          # (n_pairs, chunk) bool
+        co = b1 & b2
+        del b1, b2
 
-    WF = W @ F
-    numerators = np.asarray((WF * F).sum(axis=0)).ravel().astype(np.float64)
-    del WF
+        counts = co.sum(axis=0)                        # (chunk,)
+        corr_sums = corr_train @ co.astype(np.float32) # (chunk,)
+        del co
 
-    W1F = W1 @ F
-    sum_prods = np.asarray((W1F * F).sum(axis=0)).ravel().astype(np.float64)
-    del W1F
-
-    F2 = F ** 2
-    W1F2 = W1 @ F2
-    sum_prod_sq = np.asarray((W1F2 * F2).sum(axis=0)).ravel().astype(np.float64)
-    del W1F2, F2
-
-    prod_means = sum_prods / n_pairs
-    prod_ss = np.sqrt(np.maximum(sum_prod_sq - n_pairs * prod_means ** 2, 0.0))
-
-    valid = (counts >= args.min_support) & (prod_ss > 1e-10)
-    scores = np.where(valid, numerators / (prod_ss * corr_ss), 0.0)
-    support = np.where(valid, counts, 0).astype(np.int64)
+        for local_j in range(j_end - j_start):
+            j = j_start + local_j
+            n = counts[local_j]
+            if n >= args.min_support:
+                scores[j] = corr_sums[local_j] / n - pop_mean
+                support[j] = int(n)
 
 # ------------------------------------------------------------------
 # Match all pairs to feature indices 
