@@ -33,6 +33,8 @@ P.add_argument("--load-model", required=True)
 P.add_argument("--top-k", type=int, default=1000)
 P.add_argument("--score-weight", action="store_true", default=True)
 P.add_argument("--no-score-weight", action="store_false", dest="score_weight")
+P.add_argument("--norm-alpha", type=float, default=0.0,
+               help="Norm exponent: 0=dot product, 1=cosine similarity")
 P.add_argument(
     "--cov-ds",
     default=(
@@ -139,13 +141,15 @@ corrs_B = pairs_B["correlation"].values.astype(np.float32)
 
 cos_sims_B = np.empty(len(pairs_B), dtype=np.float32)
 batch = 500_000
+alpha = args.norm_alpha
 for s in range(0, len(pairs_B), batch):
     e = min(s + batch, len(pairs_B))
     i1, i2 = idx1[s:e], idx2[s:e]
-    cos_sims_B[s:e] = (
-        (selected_features[i1] * selected_features[i2]).sum(1)
-        / (norms[i1] * norms[i2])
-    )
+    dot = (selected_features[i1] * selected_features[i2]).sum(1)
+    if alpha > 0:
+        cos_sims_B[s:e] = dot / ((norms[i1] * norms[i2]) ** alpha)
+    else:
+        cos_sims_B[s:e] = dot
 
 rho_B, pval_B = spearmanr(cos_sims_B, corrs_B)
 
@@ -192,7 +196,7 @@ RESET = "\033[0m"
 yr_min, yr_max = min(test_years), max(test_years)
 
 spearman_table = [
-    ["New approach (supervised, k={})".format(n_selected), f"{rho_B:.4f}", f"{pval_B:.2e}"],
+    ["New approach (k={}, α={})".format(n_selected, args.norm_alpha), f"{rho_B:.4f}", f"{pval_B:.2e}"],
     ["Parent paper (PCA 4000-dim)", f"{rho_A:.4f}", f"{pval_A:.2e}"],
 ]
 
@@ -224,7 +228,8 @@ print()
 print(f"Population mean return correlation: {pop_corr:.4f}")
 print()
 print(f"New approach: supervised selection, k={n_selected}, "
-      f"score-weighted={'yes' if args.score_weight else 'no'}; "
+      f"score-weighted={'yes' if args.score_weight else 'no'}, "
+      f"α={args.norm_alpha}; "
       f"{len(test_sims_B):,d} OOS pairs")
 print(f"Parent paper: PCA 4000-dim cosine similarity; "
       f"{len(test_sims_A):,d} OOS pairs")
