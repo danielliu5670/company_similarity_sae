@@ -19,7 +19,7 @@ import joblib
 from datasets import load_dataset
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
-
+import cupy as cp
 
 P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
@@ -161,38 +161,47 @@ else:
     # Binarize features: active = nonzero after JumpReLU
     # ------------------------------------------------------------------
     print("Binarizing feature matrix...")
-    binary_matrix = (feat_matrix > 0)  # bool, ~1.6 GB for 24K x 65K
+    binary_matrix = (feat_matrix > 0)
 
     # ------------------------------------------------------------------
-    # Score each feature against return correlations
+    # Score each feature against return correlations (GPU)
     # ------------------------------------------------------------------
     print(f"Scoring {feat_dim} features (min support = {args.min_support} pairs)...")
     scores = np.zeros(feat_dim, dtype=np.float64)
     support = np.zeros(feat_dim, dtype=np.int64)
 
-    chunk_size = 128
+    binary_gpu = cp.asarray(binary_matrix)
+    idx1_gpu = cp.asarray(idx1_train)
+    idx2_gpu = cp.asarray(idx2_train)
+    corr_gpu = cp.asarray(corr_train)
+
+    chunk_size = 512
     n_chunks = (feat_dim + chunk_size - 1) // chunk_size
 
-    for ci in tqdm(range(n_chunks), desc="Scoring features (chunked)"):
+    for ci in tqdm(range(n_chunks), desc="Scoring features (GPU)"):
         j_start = ci * chunk_size
         j_end = min(j_start + chunk_size, feat_dim)
 
-        cols = binary_matrix[:, j_start:j_end]        # (n_companies, chunk) bool
-        b1 = cols[idx1_train]                          # (n_pairs, chunk) bool
-        b2 = cols[idx2_train]                          # (n_pairs, chunk) bool
+        cols = binary_gpu[:, j_start:j_end]
+        b1 = cols[idx1_gpu]
+        b2 = cols[idx2_gpu]
         co = b1 & b2
         del b1, b2
 
-        counts = co.sum(axis=0)                        # (chunk,)
-        corr_sums = corr_train @ co.astype(np.float32) # (chunk,)
+        counts = co.sum(axis=0)
+        corr_sums = corr_gpu @ co.astype(cp.float32)
         del co
 
-        for local_j in range(j_end - j_start):
-            j = j_start + local_j
-            n = counts[local_j]
-            if n >= args.min_support:
-                scores[j] = corr_sums[local_j] / n - pop_mean
-                support[j] = int(n)
+        counts_cpu = cp.asnumpy(counts)
+        corr_sums_cpu = cp.asnumpy(corr_sums)
+        j_indices = np.arange(j_start, j_end)
+        valid = counts_cpu >= args.min_support
+        if valid.any():
+            scores[j_indices[valid]] = corr_sums_cpu[valid] / counts_cpu[valid] - pop_mean
+            support[j_indices[valid]] = counts_cpu[valid]
+
+    del binary_gpu, idx1_gpu, idx2_gpu, corr_gpu
+    cp.get_default_memory_pool().free_all_blocks()
 
 # ------------------------------------------------------------------
 # Match all pairs to feature indices 
