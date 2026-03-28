@@ -15,6 +15,7 @@ import pandas as pd
 import joblib
 from datasets import load_dataset
 from scipy.stats import spearmanr
+from tabulate import tabulate
 import gc
 
 
@@ -46,7 +47,6 @@ PCTS = [0.5, 1.0, 2.0, 5.0, 10.0]
 
 # Load shared data
 
-print("Loading pairs dataset...")
 raw = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 
 ds = raw.dropna(subset=["correlation", "cosine_similarity"]).copy()
@@ -65,14 +65,12 @@ split_idx = int(0.75 * len(all_years))
 test_years = set(all_years[split_idx:])
 pop_corr = pairs_df["correlation"].mean()
 
-print("Loading company metadata...")
 df_c = load_dataset(args.cov_ds)["train"].to_pandas()
 df_c["__index_level_0__"] = df_c["__index_level_0__"].astype(str)
 df_c["year"] = df_c["year"].astype(int)
 
 # A: Parent paper (PCA 4000-dim cosine similarity)
 
-print("Parent paper approach...")
 cos_sims_A = ds["cosine_similarity"].values.astype(np.float32)
 corrs_A = ds["correlation"].values.astype(np.float32)
 rho_A, pval_A = spearmanr(cos_sims_A, corrs_A)
@@ -89,7 +87,6 @@ for pct in PCTS:
 
 # B: Our approach (supervised SAE feature selection)
 
-print("Loading SAE features and model...")
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -127,7 +124,6 @@ feat_idx_df = pd.DataFrame({
     "feat_idx": np.arange(len(df)),
 })
 
-print("Novel approach...")
 pairs_B = pairs_df.merge(
     feat_idx_df.rename(columns={"__index_level_0__": "Company1", "feat_idx": "idx1"}),
     on=["Company1", "year"], how="inner",
@@ -168,7 +164,6 @@ gc.collect()
 
 # C: SIC industry code baseline
 
-print("SIC baseline...")
 sic_info = df_c[["__index_level_0__", "year", "sic_code"]].dropna(subset=["sic_code"]).copy()
 sic_dedup = sic_info.drop_duplicates(subset=["__index_level_0__", "year"], keep="last")
 
@@ -192,29 +187,46 @@ sic_corr_test = ds_sic_test.loc[same_sic_test, "correlation"].mean()
 
 # Results
 
+BOLD = "\033[1m"
+RESET = "\033[0m"
 yr_min, yr_max = min(test_years), max(test_years)
 
+spearman_table = [
+    ["New approach (supervised, k={})".format(n_selected), f"{rho_B:.4f}", f"{pval_B:.2e}"],
+    ["Parent paper (PCA 4000-dim)", f"{rho_A:.4f}", f"{pval_A:.2e}"],
+]
+
+prec_table = []
+for pct in PCTS:
+    sic_val = f"{sic_corr_test:.4f}" if pct == 1.0 else ""
+    row = [f"top {pct:.1f}%", f"{prec_B[pct]:.4f}", f"{prec_A[pct]:.4f}", sic_val]
+    if pct == 1.0:
+        row = [f"{BOLD}{c}{RESET}" for c in row]
+    prec_table.append(row)
+
 print()
-print(f"Spearman rank correlation:")
-print(f"  {'Our approach (supervised, k=' + str(n_selected) + ')':<40s} {rho_B:.4f}  (p={pval_B:.2e})")
-print(f"  {'Parent paper (PCA 4000-dim)':<40s} {rho_A:.4f}  (p={pval_A:.2e})")
+print("Spearman rank correlation (all years)")
+print(tabulate(
+    spearman_table,
+    headers=["Approach", "Spearman rho", "p-value"],
+    tablefmt="simple_outline",
+))
 
 print()
 print(f"Precision-at-k: mean return correlation, OOS {yr_min}-{yr_max}")
-print()
-print(f"  {'Cutoff':>10s}  {'Our approach':>14s}  {'Parent paper':>14s}  {'SIC codes':>12s}")
+print(tabulate(
+    prec_table,
+    headers=["Cutoff", "New approach", "Parent paper", "SIC baseline"],
+    tablefmt="simple_outline",
+))
 
-for pct in PCTS:
-    sic_col = f"{sic_corr_test:.4f}" if pct == 1.0 else ""
-    print(f"  {'top ' + f'{pct:.1f}%':>10s}  {prec_B[pct]:>14.4f}  {prec_A[pct]:>14.4f}  {sic_col:>12s}")
-
 print()
-print(f"  Population mean: {pop_corr:.4f}")
+print(f"Population mean return correlation: {pop_corr:.4f}")
 print()
-print(f"  Our approach: supervised selection, k={n_selected}, "
+print(f"New approach: supervised selection, k={n_selected}, "
       f"score-weighted={'yes' if args.score_weight else 'no'}; "
       f"{len(test_sims_B):,d} OOS pairs")
-print(f"  Parent paper: PCA 4000-dim cosine similarity; "
+print(f"Parent paper: PCA 4000-dim cosine similarity; "
       f"{len(test_sims_A):,d} OOS pairs")
-print(f"  SIC codes: {n_same_test:,d} same-code pairs out of "
+print(f"SIC baseline: {n_same_test:,d} same-code pairs out of "
       f"{n_total_test_sic:,d} ({pct_same_test:.2f}%), shown at top 1.0%")
