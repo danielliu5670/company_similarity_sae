@@ -29,6 +29,8 @@ P.add_argument("--min-support", type=int, default=50,
                help="Minimum co-active pairs to score a feature")
 P.add_argument("--score-weight", action="store_true",
                help="Multiply each selected feature by its score before cosine sim")
+P.add_argument("--norm-alpha", type=float, nargs="+", default=[1.0],
+               help="Norm exponent(s) for similarity: 0=dot product, 1=cosine (space-separated)")
 P.add_argument("--load-model", default=None,
                help="Load pre-computed scores from this model file; skip scoring loop")
 P.add_argument(
@@ -259,64 +261,72 @@ for top_k in args.top_k:
         weights = scores[selected].astype(np.float32)
         selected_features *= weights[np.newaxis, :]
 
-    norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10)
+    raw_norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10)
 
-    # Compute cosine similarities
-    cos_sims = np.empty(len(pairs_merged), dtype=np.float32)
-    batch = 500_000
-    for s in range(0, len(pairs_merged), batch):
-        e = min(s + batch, len(pairs_merged))
-        i1, i2 = idx1[s:e], idx2[s:e]
-        cos_sims[s:e] = (
-            (selected_features[i1] * selected_features[i2]).sum(1)
-            / (norms[i1] * norms[i2])
-        )
+    for alpha in args.norm_alpha:
+        print(f"\n  --- alpha = {alpha} ---")
 
-    rho, pval = spearmanr(cos_sims, correlations)
-    print(f"\n  Spearman rho: {rho:.4f}  (p={pval:.2e})")
+        if alpha == 0:
+            norm_factors = np.ones(len(selected_features), dtype=np.float32)
+        else:
+            norm_factors = raw_norms ** alpha
 
-    # Precision-at-k (all pairs)
-    print(f"\n  Precision-at-k (all pairs, {len(cos_sims):,d} total):")
-    sorted_indices = np.argsort(cos_sims)[::-1]
-    for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
-        n_top = max(1, int(len(cos_sims) * pct / 100.0))
-        top_idx = sorted_indices[:n_top]
-        top_mean_corr = correlations[top_idx].mean()
-        print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
+        # Compute similarities
+        cos_sims = np.empty(len(pairs_merged), dtype=np.float32)
+        batch = 500_000
+        for s in range(0, len(pairs_merged), batch):
+            e = min(s + batch, len(pairs_merged))
+            i1, i2 = idx1[s:e], idx2[s:e]
+            cos_sims[s:e] = (
+                (selected_features[i1] * selected_features[i2]).sum(1)
+                / (norm_factors[i1] * norm_factors[i2])
+            )
 
-    # Precision-at-k (OOS only)
-    test_mask = pairs_merged["year"].isin(test_years).values
-    test_sims = cos_sims[test_mask]
-    test_corrs = correlations[test_mask]
-    test_sorted = np.argsort(test_sims)[::-1]
+        rho, pval = spearmanr(cos_sims, correlations)
+        print(f"\n  Spearman rho: {rho:.4f}  (p={pval:.2e})")
 
-    oos_top1_corr = np.nan
-    print(f"\n  Precision-at-k (OOS test years, {len(test_sims):,d} pairs):")
-    for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
-        n_top = max(1, int(len(test_sims) * pct / 100.0))
-        top_idx = test_sorted[:n_top]
-        top_mean_corr = test_corrs[top_idx].mean()
-        print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
-        if pct == 1.0:
-            oos_top1_corr = top_mean_corr
+        # Precision-at-k (all pairs)
+        print(f"\n  Precision-at-k (all pairs, {len(cos_sims):,d} total):")
+        sorted_indices = np.argsort(cos_sims)[::-1]
+        for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+            n_top = max(1, int(len(cos_sims) * pct / 100.0))
+            top_idx = sorted_indices[:n_top]
+            top_mean_corr = correlations[top_idx].mean()
+            print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
 
-    summary_rows.append({
-        "top_k": top_k, "n_selected": len(selected),
-        "spearman_rho": rho, "oos_top1pct_corr": oos_top1_corr,
-    })
+        # Precision-at-k (OOS only)
+        test_mask = pairs_merged["year"].isin(test_years).values
+        test_sims = cos_sims[test_mask]
+        test_corrs = correlations[test_mask]
+        test_sorted = np.argsort(test_sims)[::-1]
 
-    # Save pairs for this k
-    out_pairs_df = pairs_merged.drop(columns=["idx1", "idx2"]).copy()
-    out_pairs_df["cosine_similarity"] = cos_sims
+        oos_top1_corr = np.nan
+        print(f"\n  Precision-at-k (OOS test years, {len(test_sims):,d} pairs):")
+        for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+            n_top = max(1, int(len(test_sims) * pct / 100.0))
+            top_idx = test_sorted[:n_top]
+            top_mean_corr = test_corrs[top_idx].mean()
+            print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
+            if pct == 1.0:
+                oos_top1_corr = top_mean_corr
 
-    if len(args.top_k) == 1:
-        out_path = args.out_pairs
-    else:
-        base, ext = os.path.splitext(args.out_pairs)
-        out_path = f"{base}_k{top_k}{ext}"
+        summary_rows.append({
+            "top_k": top_k, "alpha": alpha, "n_selected": len(selected),
+            "spearman_rho": rho, "oos_top1pct_corr": oos_top1_corr,
+        })
 
-    out_pairs_df.to_pickle(out_path)
-    print(f"  Saved {len(out_pairs_df)} pairs to {out_path}")
+        # Save pairs for this k and alpha
+        out_pairs_df = pairs_merged.drop(columns=["idx1", "idx2"]).copy()
+        out_pairs_df["cosine_similarity"] = cos_sims
+
+        if len(args.top_k) == 1 and len(args.norm_alpha) == 1:
+            out_path = args.out_pairs
+        else:
+            base, ext = os.path.splitext(args.out_pairs)
+            out_path = f"{base}_k{top_k}_a{alpha}{ext}"
+
+        out_pairs_df.to_pickle(out_path)
+        print(f"  Saved {len(out_pairs_df)} pairs to {out_path}")
 
 # ------------------------------------------------------------------
 # Save model (scores array for future --load-model runs)
@@ -336,13 +346,13 @@ joblib.dump(model_bundle, args.out_model)
 print(f"\nSaved selection model to {args.out_model}")
 
 # ------------------------------------------------------------------
-# Summary table (only printed when sweeping multiple k values)
+# Summary table
 # ------------------------------------------------------------------
 if len(summary_rows) > 1:
     print(f"\n{'='*70}")
-    print("K-SWEEP SUMMARY")
+    print("SWEEP SUMMARY")
     print(f"{'='*70}")
-    print(f"  {'top_k':>8s}  {'n_sel':>6s}  {'rho':>8s}  {'OOS top1%':>10s}")
+    print(f"  {'top_k':>8s}  {'alpha':>6s}  {'n_sel':>6s}  {'rho':>8s}  {'OOS top1%':>10s}")
     for r in summary_rows:
-        print(f"  {r['top_k']:>8d}  {r['n_selected']:>6d}  {r['spearman_rho']:>8.4f}  {r['oos_top1pct_corr']:>10.4f}")
+        print(f"  {r['top_k']:>8d}  {r['alpha']:>6.2f}  {r['n_selected']:>6d}  {r['spearman_rho']:>8.4f}  {r['oos_top1pct_corr']:>10.4f}")
     print(f"{'='*70}")
