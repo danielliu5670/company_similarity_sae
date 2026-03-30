@@ -237,8 +237,7 @@ RESET = "\033[0m"
 
 
 def render_detail_table(top_k, table_rows, pct_thresholds):
-    best_all = {p: max(r["all_prec"][p] for r in table_rows) for p in pct_thresholds}
-    best_oos = {p: max(r["oos_prec"][p] for r in table_rows) for p in pct_thresholds}
+    
 
     W = [7, 14, 22, 22]
 
@@ -254,6 +253,8 @@ def render_detail_table(top_k, table_rows, pct_thresholds):
 
     for row in table_rows:
         print(hline("├", "┼", "┤"))
+        best_all_val = max(row["all_prec"].values())
+        best_oos_val = max(row["oos_prec"].values())
         for i, pct in enumerate(pct_thresholds):
             if i == 0:
                 a_s = f" {str(row['alpha']):<{W[0] - 1}}"
@@ -271,9 +272,9 @@ def render_detail_table(top_k, table_rows, pct_thresholds):
             all_c = f" {all_t:<{W[2] - 1}}"
             oos_c = f" {oos_t:<{W[3] - 1}}"
 
-            if all_v == best_all[pct]:
+            if all_v == best_all_val:
                 all_c = f" {BOLD}{all_t}{RESET}{' ' * (W[2] - 1 - len(all_t))}"
-            if oos_v == best_oos[pct]:
+            if oos_v == best_oos_val:
                 oos_c = f" {BOLD}{oos_t}{RESET}{' ' * (W[3] - 1 - len(oos_t))}"
 
             print(f"│{a_s}│{r_s}│{all_c}│{oos_c}│")
