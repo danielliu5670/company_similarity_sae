@@ -16,6 +16,7 @@ import os
 import numpy as np
 import pandas as pd
 import joblib
+from collections import defaultdict
 from datasets import load_dataset
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
@@ -50,16 +51,7 @@ os.makedirs(os.path.dirname(args.out_pairs) or ".", exist_ok=True)
 # ------------------------------------------------------------------
 # Load and unwrap features (identical to original)
 # ------------------------------------------------------------------
-print("Loading Gemma features...")
 df_f = pd.read_pickle(args.features_pkl)
-
-sample_feat = df_f["features"].iloc[0]
-print(f"  Feature type: {type(sample_feat)}, ", end="")
-if isinstance(sample_feat, (list, np.ndarray)):
-    flat = sample_feat
-    while isinstance(flat, list) and len(flat) == 1 and isinstance(flat[0], (list, np.ndarray)):
-        flat = flat[0]
-    print(f"unwrapped type: {type(flat)}, len: {len(flat) if hasattr(flat, '__len__') else 'N/A'}")
 
 
 def unwrap_feature(x):
@@ -71,12 +63,10 @@ def unwrap_feature(x):
 
 
 df_f["features"] = df_f["features"].apply(unwrap_feature)
-print(f"  Final feature shape: {df_f['features'].iloc[0].shape}")
 
 # ------------------------------------------------------------------
 # Merge with company metadata (identical to original)
 # ------------------------------------------------------------------
-print("Loading company metadata...")
 df_c = load_dataset(args.cov_ds)["train"].to_pandas()
 
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -85,12 +75,10 @@ df_c["__index_level_0__"] = df_c["__index_level_0__"].astype(str)
 df = pd.merge(df_f, df_c, on="__index_level_0__", how="inner")
 df = df.dropna(subset=["sic_code"])
 df["year"] = df["year"].astype(int)
-print(f"  Matched {len(df)} companies with features + metadata")
 
 feat_matrix = np.vstack(df["features"].values)
 nan_mask = np.isnan(feat_matrix).any(axis=1) | np.isinf(feat_matrix).any(axis=1)
 if nan_mask.sum() > 0:
-    print(f"  Dropping {nan_mask.sum()} rows with NaN/Inf features")
     df = df[~nan_mask].reset_index(drop=True)
     feat_matrix = feat_matrix[~nan_mask]
 
@@ -98,18 +86,15 @@ if len(feat_matrix) == 0:
     raise RuntimeError("No valid feature rows remain after NaN removal.")
 
 feat_dim = feat_matrix.shape[1]
-print(f"  Feature matrix: {feat_matrix.shape[0]} companies x {feat_dim} features")
 
 # ------------------------------------------------------------------
 # Load pairs dataset
 # ------------------------------------------------------------------
-print("Loading original pairs dataset...")
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
-print(f"  Loaded {len(pairs_df)} original pairs")
 
 # ------------------------------------------------------------------
 # Temporal split (must match threshold_gemma.py)
@@ -120,9 +105,6 @@ split_idx = int(0.75 * n_total)
 train_years = set(all_years[:split_idx])
 test_years = set(all_years[split_idx:])
 
-print(f"  Train years: {min(train_years)}-{max(train_years)} ({len(train_years)} years)")
-print(f"  Test years:  {min(test_years)}-{max(test_years)} ({len(test_years)} years)")
-
 # ------------------------------------------------------------------
 # Map companies to row indices in feat_matrix
 # ------------------------------------------------------------------
@@ -132,7 +114,6 @@ company_to_idx = {c: i for i, c in enumerate(company_ids)}
 # ------------------------------------------------------------------
 # Build index arrays for TRAINING pairs only
 # ------------------------------------------------------------------
-print("Preparing training pairs for feature scoring...")
 train_pairs = pairs_df[pairs_df["year"].isin(train_years)].copy()
 
 # Keep only pairs where both companies have features
@@ -147,28 +128,22 @@ idx2_train = train_pairs["Company2"].map(company_to_idx).values.astype(np.int64)
 corr_train = train_pairs["correlation"].values.astype(np.float32)
 pop_mean = corr_train.mean()
 
-print(f"  {len(train_pairs)} training pairs (population mean corr: {pop_mean:.4f})")
-
 # ------------------------------------------------------------------
 # Feature scoring: either load pre-computed or run from scratch
 # ------------------------------------------------------------------
 if args.load_model is not None:
-    print(f"\nLoading pre-computed scores from {args.load_model}...")
     saved = joblib.load(args.load_model)
     scores = saved["scores"]
     support = saved["support"]
-    print(f"  Loaded scores for {len(scores)} features")
 else:
     # ------------------------------------------------------------------
     # Binarize features: active = nonzero after JumpReLU
     # ------------------------------------------------------------------
-    print("Binarizing feature matrix...")
     binary_matrix = (feat_matrix > 0)
 
     # ------------------------------------------------------------------
     # Score each feature against return correlations (GPU)
     # ------------------------------------------------------------------
-    print(f"Scoring {feat_dim} features (min support = {args.min_support} pairs)...")
     scores = np.zeros(feat_dim, dtype=np.float64)
     support = np.zeros(feat_dim, dtype=np.int64)
 
@@ -214,7 +189,6 @@ feat_df = pd.DataFrame({
     "feat_idx": np.arange(len(df)),
 })
 
-print("Matching pairs to feature indices...")
 pairs_merged = pairs_df.merge(
     feat_df.rename(columns={"__index_level_0__": "Company1", "feat_idx": "idx1"}),
     on=["Company1", "year"], how="inner",
@@ -223,7 +197,6 @@ pairs_merged = pairs_merged.merge(
     feat_df.rename(columns={"__index_level_0__": "Company2", "feat_idx": "idx2"}),
     on=["Company2", "year"], how="inner",
 )
-print(f"  {len(pairs_merged)} pairs have both companies with features")
 
 from scipy.stats import spearmanr
 
@@ -236,24 +209,85 @@ correlations = pairs_merged["correlation"].values
 # ------------------------------------------------------------------
 ranked = np.argsort(scores)[::-1]
 summary_rows = []
+pct_thresholds = [0.5, 1.0, 2.0, 5.0, 10.0]
+
+# ------------------------------------------------------------------
+# SIC baseline
+# ------------------------------------------------------------------
+sic_values = df["sic_code"].values
+sic_strs = np.array([str(int(float(s))).zfill(4) for s in sic_values])
+sic_chars = np.array([[c for c in s] for s in sic_strs])
+s1c = sic_chars[idx1]
+s2c = sic_chars[idx2]
+sic_sims = np.cumprod(s1c == s2c, axis=1).sum(axis=1).astype(np.float32)
+sic_rho_val, _ = spearmanr(sic_sims, correlations)
+
+test_mask_all = pairs_merged["year"].isin(test_years).values
+sic_test_sims = sic_sims[test_mask_all]
+test_corrs_all = correlations[test_mask_all]
+sic_sorted = np.argsort(sic_test_sims)[::-1]
+sic_n_top = max(1, int(len(sic_test_sims) * 1.0 / 100.0))
+sic_oos_top1 = test_corrs_all[sic_sorted[:sic_n_top]].mean()
+
+# ------------------------------------------------------------------
+# Table rendering helpers
+# ------------------------------------------------------------------
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def render_detail_table(top_k, table_rows, pct_thresholds):
+    best_all = {p: max(r["all_prec"][p] for r in table_rows) for p in pct_thresholds}
+    best_oos = {p: max(r["oos_prec"][p] for r in table_rows) for p in pct_thresholds}
+
+    W = [7, 14, 22, 22]
+
+    def hline(l, m, r):
+        return f"{l}{'─' * W[0]}{m}{'─' * W[1]}{m}{'─' * W[2]}{m}{'─' * W[3]}{r}"
+
+    print(f"\ntop-k = {top_k}\n")
+    print(hline("┌", "┬", "┐"))
+    print(
+        f"│{' alpha':<{W[0]}}│{' Spearman rho':<{W[1]}}"
+        f"│{' Precision-at-k (all)':<{W[2]}}│{' Precision-at-k (OOS)':<{W[3]}}│"
+    )
+
+    for row in table_rows:
+        print(hline("├", "┼", "┤"))
+        for i, pct in enumerate(pct_thresholds):
+            if i == 0:
+                a_s = f" {str(row['alpha']):<{W[0] - 1}}"
+                rho_fmt = f"{row['rho']:.4f}"
+                r_s = f" {rho_fmt:<{W[1] - 1}}"
+            else:
+                a_s = " " * W[0]
+                r_s = " " * W[1]
+
+            all_v = row["all_prec"][pct]
+            oos_v = row["oos_prec"][pct]
+            all_t = f"Top {pct:5.1f}% = {all_v:.4f}"
+            oos_t = f"Top {pct:5.1f}% = {oos_v:.4f}"
+
+            all_c = f" {all_t:<{W[2] - 1}}"
+            oos_c = f" {oos_t:<{W[3] - 1}}"
+
+            if all_v == best_all[pct]:
+                all_c = f" {BOLD}{all_t}{RESET}{' ' * (W[2] - 1 - len(all_t))}"
+            if oos_v == best_oos[pct]:
+                oos_c = f" {BOLD}{oos_t}{RESET}{' ' * (W[3] - 1 - len(oos_t))}"
+
+            print(f"│{a_s}│{r_s}│{all_c}│{oos_c}│")
+
+    print(hline("└", "┴", "┘"))
+
 
 for top_k in args.top_k:
-    print(f"\n{'='*70}")
-    print(f"  top-k = {top_k}")
-    print(f"{'='*70}")
-
     selected = ranked[:top_k]
     selected = selected[scores[selected] > 0]
     selected = np.sort(selected)
 
-    print(f"  Selected {len(selected)} features (requested {top_k})")
     if len(selected) == 0:
-        print("  WARNING: No features scored positively, skipping.")
         continue
-
-    print(f"  Score range: {scores[selected].min():.6f} to {scores[selected].max():.6f}")
-    print(f"  Top 10 feature indices: {selected[np.argsort(scores[selected])[::-1]][:10]}")
-    print(f"  Top 10 scores:          {np.sort(scores[selected])[::-1][:10]}")
 
     # Extract and optionally score-weight
     selected_features = feat_matrix[:, selected].copy()
@@ -263,9 +297,9 @@ for top_k in args.top_k:
 
     raw_norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10)
 
-    for alpha in args.norm_alpha:
-        print(f"\n  --- alpha = {alpha} ---")
+    table_rows = []
 
+    for alpha in args.norm_alpha:
         if alpha == 0:
             norm_factors = np.ones(len(selected_features), dtype=np.float32)
         else:
@@ -283,16 +317,13 @@ for top_k in args.top_k:
             )
 
         rho, pval = spearmanr(cos_sims, correlations)
-        print(f"\n  Spearman rho: {rho:.4f}  (p={pval:.2e})")
 
         # Precision-at-k (all pairs)
-        print(f"\n  Precision-at-k (all pairs, {len(cos_sims):,d} total):")
         sorted_indices = np.argsort(cos_sims)[::-1]
-        for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+        all_prec = {}
+        for pct in pct_thresholds:
             n_top = max(1, int(len(cos_sims) * pct / 100.0))
-            top_idx = sorted_indices[:n_top]
-            top_mean_corr = correlations[top_idx].mean()
-            print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
+            all_prec[pct] = correlations[sorted_indices[:n_top]].mean()
 
         # Precision-at-k (OOS only)
         test_mask = pairs_merged["year"].isin(test_years).values
@@ -300,15 +331,18 @@ for top_k in args.top_k:
         test_corrs = correlations[test_mask]
         test_sorted = np.argsort(test_sims)[::-1]
 
+        oos_prec = {}
         oos_top1_corr = np.nan
-        print(f"\n  Precision-at-k (OOS test years, {len(test_sims):,d} pairs):")
-        for pct in [0.5, 1.0, 2.0, 5.0, 10.0]:
+        for pct in pct_thresholds:
             n_top = max(1, int(len(test_sims) * pct / 100.0))
-            top_idx = test_sorted[:n_top]
-            top_mean_corr = test_corrs[top_idx].mean()
-            print(f"    Top {pct:5.1f}% ({n_top:>8,d} pairs): mean return corr = {top_mean_corr:.4f}")
+            oos_prec[pct] = test_corrs[test_sorted[:n_top]].mean()
             if pct == 1.0:
-                oos_top1_corr = top_mean_corr
+                oos_top1_corr = oos_prec[pct]
+
+        table_rows.append({
+            "alpha": alpha, "rho": rho,
+            "all_prec": all_prec, "oos_prec": oos_prec,
+        })
 
         summary_rows.append({
             "top_k": top_k, "alpha": alpha, "n_selected": len(selected),
@@ -326,7 +360,8 @@ for top_k in args.top_k:
             out_path = f"{base}_k{top_k}_a{alpha}{ext}"
 
         out_pairs_df.to_pickle(out_path)
-        print(f"  Saved {len(out_pairs_df)} pairs to {out_path}")
+
+    render_detail_table(top_k, table_rows, pct_thresholds)
 
 # ------------------------------------------------------------------
 # Save model (scores array for future --load-model runs)
@@ -343,16 +378,56 @@ model_bundle = {
     "top_k_used": len(selected),
 }
 joblib.dump(model_bundle, args.out_model)
-print(f"\nSaved selection model to {args.out_model}")
 
 # ------------------------------------------------------------------
 # Summary table
 # ------------------------------------------------------------------
-if len(summary_rows) > 1:
-    print(f"\n{'='*70}")
-    print("SWEEP SUMMARY")
-    print(f"{'='*70}")
-    print(f"  {'top_k':>8s}  {'alpha':>6s}  {'n_sel':>6s}  {'rho':>8s}  {'OOS top1%':>10s}")
+if summary_rows:
+    best_by_k = defaultdict(lambda: -np.inf)
     for r in summary_rows:
-        print(f"  {r['top_k']:>8d}  {r['alpha']:>6.2f}  {r['n_selected']:>6d}  {r['spearman_rho']:>8.4f}  {r['oos_top1pct_corr']:>10.4f}")
-    print(f"{'='*70}")
+        if r["oos_top1pct_corr"] > best_by_k[r["top_k"]]:
+            best_by_k[r["top_k"]] = r["oos_top1pct_corr"]
+
+    SW = [7, 7, 8, 16]
+
+    def shline(l, m, r):
+        return f"{l}{'─' * SW[0]}{m}{'─' * SW[1]}{m}{'─' * SW[2]}{m}{'─' * SW[3]}{r}"
+
+    print(f"\nSummary:\n")
+    print(shline("┌", "┬", "┐"))
+    print(
+        f"│{' top k':<{SW[0]}}│{' alpha':<{SW[1]}}"
+        f"│{' rho':<{SW[2]}}│{' top 1.0% (OOS)':<{SW[3]}}│"
+    )
+    print(shline("├", "┼", "┤"))
+
+    prev_k = None
+    for r in summary_rows:
+        if prev_k is not None and r["top_k"] != prev_k:
+            print(shline("├", "┼", "┤"))
+
+        k_fmt = str(r["top_k"])
+        a_fmt = f"{r['alpha']:.2f}"
+        rho_fmt = f"{r['spearman_rho']:.4f}"
+        oos_fmt = f"{r['oos_top1pct_corr']:.4f}"
+
+        k_s = f" {k_fmt:<{SW[0] - 1}}"
+        a_s = f" {a_fmt:<{SW[1] - 1}}"
+        rho_s = f" {rho_fmt:<{SW[2] - 1}}"
+
+        if r["oos_top1pct_corr"] == best_by_k[r["top_k"]]:
+            oos_s = f" {BOLD}{oos_fmt}{RESET}{' ' * (SW[3] - 1 - len(oos_fmt))}"
+        else:
+            oos_s = f" {oos_fmt:<{SW[3] - 1}}"
+
+        print(f"│{k_s}│{a_s}│{rho_s}│{oos_s}│")
+        prev_k = r["top_k"]
+
+    print(shline("├", "┼", "┤"))
+    sic_rho_fmt = f"{sic_rho_val:.4f}"
+    sic_oos_fmt = f"{sic_oos_top1:.4f}"
+    print(
+        f"│{' SIC':<{SW[0]}}│{' ' * SW[1]}"
+        f"│ {sic_rho_fmt:<{SW[2] - 1}}│ {sic_oos_fmt:<{SW[3] - 1}}│"
+    )
+    print(shline("└", "┴", "┘"))
