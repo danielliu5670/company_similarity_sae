@@ -145,6 +145,29 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 
+def _fix_separators(table_str):
+    """Fix SEPARATING_LINE rendering in simple_outline format."""
+    lines = table_str.split('\n')
+    sep = None
+    for line in lines:
+        if line.lstrip().startswith('├') and '┼' in line:
+            sep = line
+            break
+    if sep is None:
+        return table_str
+    fixed = []
+    for line in lines:
+        stripped = line.replace('│', '').replace(' ', '')
+        if (stripped == '' and '│' in line
+                and not line.lstrip().startswith('┌')
+                and not line.lstrip().startswith('└')
+                and not line.lstrip().startswith('├')):
+            fixed.append(sep)
+        else:
+            fixed.append(line)
+    return '\n'.join(fixed)
+
+
 def _fmt(val):
     return f"{val:.4f}"
 
@@ -230,9 +253,9 @@ rows.append(["Population mean", "", "", _fmt(pop_mean_full)])
 rows.append(["Population mean", "", "", _fmt(pop_mean_no2020)])
 rows.append(["(excl. 2020)", "", "", ""])
 
-table_main = tabulate(rows,
+table_main = _fix_separators(tabulate(rows,
                       headers=["Method", "Spearman rho", "Cutoff", "Mean correlation"],
-                      tablefmt="simple_outline")
+                      tablefmt="simple_outline"))
 
 # ---- Build per-year table ----
 year_data = []
