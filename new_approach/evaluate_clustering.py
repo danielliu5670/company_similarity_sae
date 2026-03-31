@@ -160,7 +160,7 @@ def sweep_theta(msts, pair_lookup, years, thetas):
     best_mc = -np.inf
     results = []
 
-    for theta in tqdm(thetas, desc="Theta sweep"):
+    for theta in tqdm(thetas, desc="Sweeping Theta"):
         yc = []
         for year in years:
             if msts.get(year) is not None:
@@ -204,7 +204,6 @@ args = P.parse_args()
 
 
 # ---- Load shared data ----
-print("Loading pairs dataset...")
 raw = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = raw.dropna(subset=["correlation", "cosine_similarity"]).copy()
 pairs_df["year"] = pairs_df["year"].astype(int)
@@ -218,19 +217,12 @@ train_years = all_years[:split_idx]
 test_years = all_years[split_idx:]
 pop_corr = pairs_df["correlation"].mean()
 
-print(f"  {len(pairs_df):,d} pairs, {all_years[0]}-{all_years[-1]}")
-print(f"  Train: {train_years[0]}-{train_years[-1]} ({len(train_years)} yrs)")
-print(f"  Test:  {test_years[0]}-{test_years[-1]} ({len(test_years)} yrs)")
-print(f"  Population mean corr: {pop_corr:.4f}")
-
-print("\nLoading company metadata...")
 df_c = load_dataset(args.cov_ds)["train"].to_pandas()
 df_c["__index_level_0__"] = df_c["__index_level_0__"].astype(str)
 df_c["year"] = df_c["year"].astype(int)
 
 
 # ---- Load features + model ----
-print("\nLoading features...")
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -253,7 +245,6 @@ selected = ranked[:args.top_k]
 selected = selected[scores[selected] > 0]
 selected = np.sort(selected)
 n_selected = len(selected)
-print(f"  {n_selected} features selected")
 
 selected_features = feat_matrix[:, selected].copy().astype(np.float32)
 if args.score_weight:
@@ -272,7 +263,6 @@ feat_idx_df = pd.DataFrame({
 
 
 # ---- Merge to common pair set ----
-print("\nMerging pairs with feature indices...")
 pairs_merged = pairs_df.merge(
     feat_idx_df.rename(columns={
         "__index_level_0__": "Company1", "feat_idx": "idx1",
@@ -285,11 +275,9 @@ pairs_merged = pairs_merged.merge(
     }),
     on=["Company2", "year"], how="inner",
 )
-print(f"  {len(pairs_merged):,d} common pairs")
 
 
 # ---- Compute our similarities ----
-print("Computing our similarities...")
 idx1 = pairs_merged["idx1"].values
 idx2 = pairs_merged["idx2"].values
 alpha = args.norm_alpha
@@ -331,10 +319,7 @@ pairs_merged["dist_ours_s"] = scaler_B.transform(
 
 
 # ---- Precompute pair lookup ----
-print("\nBuilding pair lookup...")
-t0 = time.time()
 pair_lookup = build_pair_lookup(pairs_merged, all_years)
-print(f"  Done in {time.time() - t0:.1f}s")
 
 thetas = np.arange(
     args.theta_min, args.theta_max + args.theta_step / 2, args.theta_step
@@ -345,9 +330,7 @@ thetas = np.round(thetas, 2)
 # ================================================================
 # METHOD A: Parent paper (PCA cosine similarity)
 # ================================================================
-print("\n" + "=" * 70)
-print("METHOD A: Parent paper (PCA 4000-dim cosine similarity)")
-print("=" * 70)
+print("\nParent paper:")
 
 msts_A = build_msts(pairs_merged, all_years, "dist_pca_s")
 best_theta_A, sweep_A = sweep_theta(
@@ -360,8 +343,6 @@ if best_theta_A is None:
 elif best_theta_A == thetas[0] or best_theta_A == thetas[-1]:
     print(f"  WARNING: best theta at boundary ({best_theta_A:.2f}), "
           "consider expanding range.")
-
-print(f"\n  Best theta (train, unweighted MC): {best_theta_A:.2f}")
 
 test_cl_A = [
     (y, clusters_at_theta(msts_A[y], best_theta_A))
@@ -376,19 +357,13 @@ all_cl_A = [
     for y in all_years if msts_A.get(y) is not None
 ]
 mc_uw_A_all, mc_pw_A_all, _ = evaluate_clusters(pair_lookup, all_cl_A)
-
-print(f"  OOS unweighted MC:    {mc_uw_A_oos:.4f}")
-print(f"  OOS pair-weighted MC: {mc_pw_A_oos:.4f}")
 del msts_A; gc.collect()
 
 
 # ================================================================
 # METHOD B: Our approach (supervised SAE)
 # ================================================================
-print("\n" + "=" * 70)
-print(f"METHOD B: Our approach (k={n_selected}, "
-      f"\u03b1={args.norm_alpha})")
-print("=" * 70)
+print(f"\nNew method:")
 
 msts_B = build_msts(pairs_merged, all_years, "dist_ours_s")
 best_theta_B, sweep_B = sweep_theta(
@@ -401,8 +376,6 @@ if best_theta_B is None:
 elif best_theta_B == thetas[0] or best_theta_B == thetas[-1]:
     print(f"  WARNING: best theta at boundary ({best_theta_B:.2f}), "
           "consider expanding range.")
-
-print(f"\n  Best theta (train, unweighted MC): {best_theta_B:.2f}")
 
 test_cl_B = [
     (y, clusters_at_theta(msts_B[y], best_theta_B))
@@ -417,18 +390,12 @@ all_cl_B = [
     for y in all_years if msts_B.get(y) is not None
 ]
 mc_uw_B_all, mc_pw_B_all, _ = evaluate_clusters(pair_lookup, all_cl_B)
-
-print(f"  OOS unweighted MC:    {mc_uw_B_oos:.4f}")
-print(f"  OOS pair-weighted MC: {mc_pw_B_oos:.4f}")
 del msts_B; gc.collect()
 
 
 # ================================================================
 # METHOD C: SIC code baseline
 # ================================================================
-print("\n" + "=" * 70)
-print("METHOD C: SIC code baseline")
-print("=" * 70)
 
 sic_info = df_c[["__index_level_0__", "year", "sic_code"]].dropna(
     subset=["sic_code"]
@@ -455,99 +422,82 @@ mc_uw_C_all, mc_pw_C_all, _ = evaluate_clusters(
     pair_lookup, sic_year_clusters
 )
 
-print(f"  OOS unweighted MC:    {mc_uw_C_oos:.4f}")
-print(f"  OOS pair-weighted MC: {mc_pw_C_oos:.4f}")
-
 
 # ================================================================
 # Report
 # ================================================================
-yr_lo, yr_hi = min(test_years), max(test_years)
 
-print("\n" + "=" * 70)
-print("CLUSTERING COMPARISON")
-print("=" * 70)
+# Helper: bold the row with the highest OOS value
+def _bold_best(rows, oos_col_idx=1):
+    best_val = max(float(r[oos_col_idx]) for r in rows)
+    out = []
+    for r in rows:
+        if float(r[oos_col_idx]) == best_val:
+            out.append([f"\033[1m{c}\033[0m" for c in r])
+        else:
+            out.append(list(r))
+    return out
 
 # Table 1: Unweighted MC(Gk)
-print(f"\nUnweighted MC(Gk): each cluster weighted equally")
+print(f"\nUnweighted MC(Gk)")
 uw_table = [
-    [f"Our approach (k={n_selected}, \u03b1={args.norm_alpha})",
+    ["New method",
      f"{mc_uw_B_oos:.4f}", f"{mc_uw_B_all:.4f}"],
-    ["Parent paper (PCA cosine)",
+    ["Parent paper",
      f"{mc_uw_A_oos:.4f}", f"{mc_uw_A_all:.4f}"],
-    ["SIC code clusters",
+    ["SIC code",
      f"{mc_uw_C_oos:.4f}", f"{mc_uw_C_all:.4f}"],
     ["Population mean",
      f"{pop_corr:.4f}", f"{pop_corr:.4f}"],
 ]
 print(tabulate(
-    uw_table,
-    headers=["Approach", f"OOS {yr_lo}-{yr_hi}", "All years"],
+    _bold_best(uw_table),
+    headers=["Approach", "OOS", "All years"],
     tablefmt="simple_outline",
 ))
 
-# Table 2: Pair-weighted MC(Gk)
-print(f"\nPair-weighted MC(Gk): each intra-cluster pair weighted equally")
+# Table 2: Weighted MC(Gk)
+print(f"\nWeighted MC(Gk)")
 pw_table = [
-    [f"Our approach (k={n_selected}, \u03b1={args.norm_alpha})",
+    ["New method",
      f"{mc_pw_B_oos:.4f}", f"{mc_pw_B_all:.4f}"],
-    ["Parent paper (PCA cosine)",
+    ["Parent paper",
      f"{mc_pw_A_oos:.4f}", f"{mc_pw_A_all:.4f}"],
-    ["SIC code clusters",
+    ["SIC code",
      f"{mc_pw_C_oos:.4f}", f"{mc_pw_C_all:.4f}"],
     ["Population mean",
      f"{pop_corr:.4f}", f"{pop_corr:.4f}"],
 ]
 print(tabulate(
-    pw_table,
-    headers=["Approach", f"OOS {yr_lo}-{yr_hi}", "All years"],
+    _bold_best(pw_table),
+    headers=["Approach", "OOS", "All years"],
     tablefmt="simple_outline",
 ))
 
 
 # Per-year breakdowns
-def print_yearly(label, theta_val, details):
-    print(f"\n{label} (\u03b8={theta_val:.2f}):")
-    hdr = (f"  {'Year':>6s}  {'Clust':>6s}  {'Pairs':>10s}  "
-           f"{'MC unwtd':>10s}  {'MC pwtd':>10s}  "
-           f"{'Med sz':>8s}  {'Max sz':>8s}  {'Covered':>8s}")
-    print(hdr)
+def print_yearly(label, details):
+    print(f"\n{label}")
+    rows = []
     for d in sorted(details, key=lambda x: x["year"]):
-        print(
-            f"  {d['year']:>6d}  {d['n_clusters']:>6d}  "
-            f"{d['n_intra_pairs']:>10,d}  "
-            f"{d['mc_unweighted']:>10.4f}  "
-            f"{d['mc_pair_weighted']:>10.4f}  "
-            f"{d['median_size']:>8d}  {d['max_size']:>8d}  "
-            f"{d['n_covered']:>8d}"
-        )
+        rows.append([
+            d["year"],
+            d["n_clusters"],
+            f"{d['n_intra_pairs']:,d}",
+            f"{d['mc_unweighted']:.4f}",
+            f"{d['mc_pair_weighted']:.4f}",
+            d["median_size"],
+            d["max_size"],
+            d["n_covered"],
+        ])
+    print(tabulate(
+        rows,
+        headers=["Year", "Clust", "Pairs", "MC unwtd", "MC wtd",
+                 "Med sz", "Max sz", "Covered"],
+        tablefmt="simple_outline",
+    ))
 
 
-print_yearly("Our approach OOS", best_theta_B, det_B_oos)
-print_yearly("Parent paper OOS", best_theta_A, det_A_oos)
-print_yearly("SIC baseline OOS", 0.0, det_C_oos)
-
-
-# Theta sweep summaries
-print(f"\nTheta sweep (train years):")
-
-print(f"\n  Parent paper:")
-print(f"  {'\u03b8':>8s}  {'MC unwtd':>10s}  {'MC pwtd':>10s}")
-for r in sweep_A:
-    m = " <--" if r["theta"] == best_theta_A else ""
-    print(f"  {r['theta']:>8.2f}  {r['mc_unweighted']:>10.4f}  "
-          f"{r['mc_pair_weighted']:>10.4f}{m}")
-
-print(f"\n  Our approach:")
-print(f"  {'\u03b8':>8s}  {'MC unwtd':>10s}  {'MC pwtd':>10s}")
-for r in sweep_B:
-    m = " <--" if r["theta"] == best_theta_B else ""
-    print(f"  {r['theta']:>8.2f}  {r['mc_unweighted']:>10.4f}  "
-          f"{r['mc_pair_weighted']:>10.4f}{m}")
-
-
-print(f"\n{'=' * 70}")
-print(f"Population mean return correlation: {pop_corr:.4f}")
-print(f"Best \u03b8: parent paper = {best_theta_A:.2f}, "
-      f"our approach = {best_theta_B:.2f}")
-print(f"{'=' * 70}")
+print_yearly(f"New method OOS (\u03b8={best_theta_B:.2f}):", det_B_oos)
+print_yearly(f"Parent paper OOS (\u03b8={best_theta_A:.2f}):", det_A_oos)
+print_yearly("SIC baseline OOS:", det_C_oos)
