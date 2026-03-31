@@ -20,8 +20,7 @@ import cupy as cp
 import joblib
 from datasets import load_dataset
 from scipy.stats import spearmanr
-from tabulate import tabulate
-from tqdm import tqdm
+from tabulate import tabulate, SEPARATING_LINE
 import gc
 
 def unwrap_feature(x):
@@ -50,12 +49,10 @@ args = P.parse_args()
 PCTS = [0.5, 1.0, 2.0, 5.0, 10.0]
 
 # ---- Load data (same as evaluate.py) ----
-print("Loading features...")
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
 
-print("Loading metadata...")
 df_c = load_dataset(args.cov_ds)["train"].to_pandas()
 df_c["__index_level_0__"] = df_c["__index_level_0__"].astype(str)
 df_c["year"] = df_c["year"].astype(int)
@@ -79,7 +76,6 @@ selected = ranked[:args.top_k]
 selected = selected[scores[selected] > 0]
 selected = np.sort(selected)
 n_selected = len(selected)
-print(f"  Selected {n_selected} features")
 
 selected_features = feat_matrix[:, selected].copy().astype(np.float32)
 weights = scores[selected].astype(np.float32)
@@ -90,7 +86,6 @@ feat_norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10).astype(np
 del feat_matrix; gc.collect()
 
 # ---- Load pairs ----
-print("Loading pairs...")
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
@@ -126,15 +121,13 @@ correlations = pairs_merged["correlation"].values.astype(np.float32)
 n_pairs = len(pairs_merged)
 
 # ---- Compute similarities on GPU (dot product, alpha=0) ----
-print("Computing similarities on GPU...")
 sel_gpu = cp.asarray(selected_features)
 idx1_gpu = cp.asarray(idx1)
 idx2_gpu = cp.asarray(idx2)
 sims = np.empty(n_pairs, dtype=np.float32)
 
 pair_batch = args.pair_batch
-for s in tqdm(range(0, n_pairs, pair_batch), desc="Dot products (GPU)",
-              total=(n_pairs + pair_batch - 1) // pair_batch):
+for s in range(0, n_pairs, pair_batch):
     e = min(s + pair_batch, n_pairs)
     a = sel_gpu[idx1_gpu[s:e]]
     b = sel_gpu[idx2_gpu[s:e]]
@@ -144,48 +137,105 @@ for s in tqdm(range(0, n_pairs, pair_batch), desc="Dot products (GPU)",
 del sel_gpu, idx1_gpu, idx2_gpu
 cp.get_default_memory_pool().free_all_blocks()
 
-# ---- Evaluation helper ----
-def evaluate(sim_values, corr_values, label):
-    rho, pval = spearmanr(sim_values, corr_values)
-    sorted_idx = np.argsort(sim_values)[::-1]
-
-    print(f"\n--- {label} ({len(sim_values):,d} pairs) ---")
-    print(f"Spearman rho: {rho:.4f} (p={pval:.2e})")
-    rows = []
-    for pct in PCTS:
-        n_top = max(1, int(len(sim_values) * pct / 100.0))
-        top_mean = corr_values[sorted_idx[:n_top]].mean()
-        rows.append([f"top {pct:.1f}%", f"{top_mean:.4f}"])
-    print(tabulate(rows, headers=["Cutoff", "Mean return corr"],
-                   tablefmt="simple_outline"))
-    return rho
-
 # ================================================================
-# CHECK 1: Exclude 2020
+# Compute metrics and build output
 # ================================================================
-print(f"\n{'='*70}")
-print("CHECK 1: EXCLUDE 2020 FROM OOS")
-print(f"{'='*70}")
 
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def _fmt(val):
+    return f"{val:.4f}"
+
+
+def _bold(s):
+    return f"{BOLD}{s}{RESET}"
+
+
+def _cell(val, is_best):
+    s = _fmt(val)
+    return _bold(s) if is_best else s
+
+
+# ---- Masks ----
 test_mask_full = pairs_merged["year"].isin(test_years).values
 test_mask_no2020 = pairs_merged["year"].isin(test_years_no2020).values
-mask_2020_only = pairs_merged["year"].eq(2020).values
+mask_2020 = pairs_merged["year"].eq(2020).values
 
-n_2020 = mask_2020_only.sum()
+# ---- Baseline OOS ----
+test_sims = sims[test_mask_full]
+test_corrs = correlations[test_mask_full]
+rho_baseline, _ = spearmanr(test_sims, test_corrs)
+sorted_baseline = np.argsort(test_sims)[::-1]
+
+# ---- OOS excluding 2020 ----
+sims_no2020 = sims[test_mask_no2020]
+corrs_no2020 = correlations[test_mask_no2020]
+rho_no2020, _ = spearmanr(sims_no2020, corrs_no2020)
+sorted_no2020 = np.argsort(sims_no2020)[::-1]
+
+# ---- Norm residualization ----
+norm_products = feat_norms[idx1] * feat_norms[idx2]
+test_norm_prods = norm_products[test_mask_full]
+corr_sim_norm = np.corrcoef(sims, norm_products)[0, 1]
+slope = np.cov(test_norm_prods, test_sims)[0, 1] / np.var(test_norm_prods)
+intercept = test_sims.mean() - slope * test_norm_prods.mean()
+residuals_test = test_sims - (slope * test_norm_prods + intercept)
+r_squared = 1 - np.var(residuals_test) / np.var(test_sims)
+rho_resid, _ = spearmanr(residuals_test, test_corrs)
+sorted_resid = np.argsort(residuals_test)[::-1]
+
+# ---- Population means ----
+pop_mean_full = test_corrs.mean()
+pop_mean_no2020 = corrs_no2020.mean()
+
+# ---- 2020 statistics ----
 n_test = test_mask_full.sum()
-print(f"\n  2020 pairs: {n_2020:,d} out of {n_test:,d} OOS pairs "
-      f"({100*n_2020/n_test:.1f}%)")
-print(f"  Mean return corr in 2020 pairs: {correlations[mask_2020_only].mean():.4f}")
-print(f"  Mean return corr in non-2020 OOS: {correlations[test_mask_no2020].mean():.4f}")
+n_2020 = mask_2020.sum()
 
-evaluate(sims[test_mask_full], correlations[test_mask_full],
-         "OOS with 2020 (baseline)")
-evaluate(sims[test_mask_no2020], correlations[test_mask_no2020],
-         "OOS without 2020")
+# ---- Collect lifts per condition ----
+conditions = [
+    ("OOS baseline", rho_baseline, sorted_baseline, test_corrs),
+    ("OOS excl. 2020", rho_no2020, sorted_no2020, corrs_no2020),
+    ("Norm-residualized", rho_resid, sorted_resid, test_corrs),
+]
 
-# Per-year breakdown
-print("\n  Per-year OOS breakdown:")
-print(f"  {'Year':>6s}  {'Pairs':>10s}  {'Spearman':>10s}  {'Top 1%':>10s}  {'Pop corr':>10s}")
+lifts = {}
+for name, _rho, srt, corrs in conditions:
+    lifts[name] = {}
+    for pct in PCTS:
+        n_top = max(1, int(len(corrs) * pct / 100.0))
+        lifts[name][pct] = corrs[srt[:n_top]].mean()
+
+# ---- Determine best values ----
+all_rhos = [c[1] for c in conditions]
+best_rho = max(all_rhos)
+best_lift = {pct: max(lifts[n][pct] for n, _, _, _ in conditions) for pct in PCTS}
+
+# ---- Build main table ----
+rows = []
+for name, rho, _srt, _corrs in conditions:
+    for i, pct in enumerate(PCTS):
+        lift_val = lifts[name][pct]
+        rows.append([
+            name if i == 0 else "",
+            _cell(rho, abs(rho - best_rho) < 1e-8) if i == 0 else "",
+            f"top {pct:.1f}%",
+            _cell(lift_val, abs(lift_val - best_lift[pct]) < 1e-8),
+        ])
+    rows.append(SEPARATING_LINE)
+
+rows.append(["Population mean", "", "", _fmt(pop_mean_full)])
+rows.append(["Population mean", "", "", _fmt(pop_mean_no2020)])
+rows.append(["(excl. 2020)", "", "", ""])
+
+table_main = tabulate(rows,
+                      headers=["Method", "Spearman rho", "Cutoff", "Mean correlation"],
+                      tablefmt="simple_outline")
+
+# ---- Build per-year table ----
+year_data = []
 for year in sorted(test_years):
     ymask = pairs_merged["year"].eq(year).values
     if ymask.sum() < 100:
@@ -196,39 +246,30 @@ for year in sorted(test_years):
     ysorted = np.argsort(ys)[::-1]
     ntop = max(1, int(len(ys) * 1.0 / 100.0))
     top1_mean = yc[ysorted[:ntop]].mean()
-    print(f"  {year:>6d}  {ymask.sum():>10,d}  {yr:>10.4f}  {top1_mean:>10.4f}  {yc.mean():>10.4f}")
+    year_data.append((year, ymask.sum(), yr, top1_mean, yc.mean()))
 
-# ================================================================
-# CHECK 2: Norm residualization
-# ================================================================
-print(f"\n{'='*70}")
-print("CHECK 2: NORM RESIDUALIZATION")
-print(f"{'='*70}")
+best_year_rho = max(d[2] for d in year_data)
+best_year_top1 = max(d[3] for d in year_data)
 
-norm_products = feat_norms[idx1] * feat_norms[idx2]
+year_rows = []
+for year, n_pairs_y, yr, top1, popc in year_data:
+    year_rows.append([
+        str(year),
+        f"{n_pairs_y:,d}",
+        _cell(yr, abs(yr - best_year_rho) < 1e-8),
+        _cell(top1, abs(top1 - best_year_top1) < 1e-8),
+        _fmt(popc),
+    ])
 
-print(f"\n  Corr(dot_product_sim, norm_product): "
-      f"{np.corrcoef(sims, norm_products)[0,1]:.4f}")
+table_years = tabulate(year_rows,
+                       headers=["Year", "Pairs", "Spearman rho", "Top 1%", "Pop corr"],
+                       tablefmt="simple_outline",
+                       colalign=("right", "right", "right", "right", "right"))
 
-# OLS on test set: sims = slope * norm_products + intercept + residual
-test_sims = sims[test_mask_full]
-test_corrs = correlations[test_mask_full]
-test_norm_prods = norm_products[test_mask_full]
-
-slope = np.cov(test_norm_prods, test_sims)[0, 1] / np.var(test_norm_prods)
-intercept = test_sims.mean() - slope * test_norm_prods.mean()
-residuals_test = test_sims - (slope * test_norm_prods + intercept)
-r_squared = 1 - np.var(residuals_test) / np.var(test_sims)
-
-print(f"  OLS: sim = {slope:.6f} * norm_product + {intercept:.6f}")
-print(f"  R^2 of norm product on similarity: {r_squared:.4f}")
-
-evaluate(test_sims, test_corrs, "OOS raw dot product (baseline)")
-evaluate(residuals_test, test_corrs, "OOS after norm residualization")
-
-print(f"\n{'='*70}")
-print("INTERPRETATION:")
-print("  If top-1% lift remains strong after residualization,")
-print("  the signal is content-driven, not magnitude-driven.")
-print("  If it collapses, description length is a confound.")
-print(f"{'='*70}")
+# ---- Print output ----
+print(table_main)
+print(f"\nBy Year (OOS):")
+print(table_years)
+print(f"\nOther Stats:\n2020 Population MC: {correlations[mask_2020].mean():.4f}")
+print(f"Corr(Similarity, Norm_Product): {corr_sim_norm:.4f}")
+print(f"R^2 (Norm vs. Similarity): {r_squared:.4f}")

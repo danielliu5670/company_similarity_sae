@@ -207,13 +207,40 @@ all_sorted_sup = np.argsort(sims)[::-1]
 all_sorted_unsup = np.argsort(cos_unsup)[::-1]
 
 # ---- Build report tables ----
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
 def _fmt(val):
     return f"{val:.4f}" if val is not None else "N/A"
+
+def _bold(s):
+    return f"{BOLD}{s}{RESET}"
 
 def _build_table(sup_rho, unsup_rho, sae_rho,
                  sup_sorted, unsup_sorted, sae_lifts_dict,
                  ref_corrs, pop_mean):
-    """Build a consolidated results table."""
+    """Build a consolidated results table with bolded best values."""
+    # Collect all lift values per cutoff to determine maxima
+    all_lifts = {}
+    for pct in PCTS:
+        entries = []
+        n_top = max(1, int(len(ref_corrs) * pct / 100.0))
+        entries.append(ref_corrs[sup_sorted[:n_top]].mean())
+        if sae_lifts_dict:
+            entries.append(sae_lifts_dict[pct])
+        entries.append(ref_corrs[unsup_sorted[:n_top]].mean())
+        all_lifts[pct] = entries
+
+    best_lift = {pct: max(vals) for pct, vals in all_lifts.items()}
+
+    rhos = [sup_rho, sae_rho, unsup_rho]
+    valid_rhos = [r for r in rhos if r is not None]
+    best_rho = max(valid_rhos) if valid_rhos else None
+
+    def _cell(val, is_best):
+        s = _fmt(val)
+        return _bold(s) if (is_best and val is not None) else s
+
     rows = []
     # Supervised PCA rows
     for i, pct in enumerate(PCTS):
@@ -221,25 +248,27 @@ def _build_table(sup_rho, unsup_rho, sae_rho,
         top_mean = ref_corrs[sup_sorted[:n_top]].mean()
         rows.append([
             "Supervised PCA" if i == 0 else "",
-            _fmt(sup_rho) if i == 0 else "",
+            _cell(sup_rho, sup_rho == best_rho) if i == 0 else "",
             f"top {pct:.1f}%",
-            _fmt(top_mean),
+            _cell(top_mean, abs(top_mean - best_lift[pct]) < 1e-8),
         ])
     rows.append(SEPARATING_LINE)
     # SAE (new method) rows
     for i, pct in enumerate(PCTS):
         name = ["New method", "(Supervised", "selection)", "", ""][i]
-        rho_cell = _fmt(sae_rho) if i == 0 else ""
-        lift_val = _fmt(sae_lifts_dict[pct]) if sae_lifts_dict else "N/A"
-        rows.append([name, rho_cell, f"top {pct:.1f}%", lift_val])
+        rho_cell = _cell(sae_rho, sae_rho == best_rho) if i == 0 else ""
+        lift_val = sae_lifts_dict[pct] if sae_lifts_dict else None
+        is_best = (lift_val is not None and abs(lift_val - best_lift[pct]) < 1e-8)
+        rows.append([name, rho_cell, f"top {pct:.1f}%", _cell(lift_val, is_best)])
     rows.append(SEPARATING_LINE)
     # Parent paper (unsupervised PCA) rows
     for i, pct in enumerate(PCTS):
         name = ["Parent paper", "(Unsupervised", "PCA)", "", ""][i]
-        rho_cell = _fmt(unsup_rho) if i == 0 else ""
+        rho_cell = _cell(unsup_rho, unsup_rho == best_rho) if i == 0 else ""
         n_top = max(1, int(len(ref_corrs) * pct / 100.0))
         top_mean = ref_corrs[unsup_sorted[:n_top]].mean()
-        rows.append([name, rho_cell, f"top {pct:.1f}%", _fmt(top_mean)])
+        rows.append([name, rho_cell, f"top {pct:.1f}%",
+                     _cell(top_mean, abs(top_mean - best_lift[pct]) < 1e-8)])
     rows.append(SEPARATING_LINE)
     # Population mean
     rows.append(["Population", "", "", _fmt(pop_mean)])
