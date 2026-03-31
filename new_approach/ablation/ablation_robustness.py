@@ -157,7 +157,7 @@ def _fix_separators(table_str):
         return table_str
     fixed = []
     for line in lines:
-        stripped = line.replace('│', '').replace(' ', '')
+        stripped = line.replace('│', '').replace(' ', '').replace('\x01', '')
         if (stripped == '' and '│' in line
                 and not line.lstrip().startswith('┌')
                 and not line.lstrip().startswith('└')
