@@ -1,0 +1,17 @@
+plotly
+kaleido
+datasets
+transformers
+pandas
+psutil
+joblib
+optuna
+numpy
+matplotlib
+tqdm
+scikit-learn
+scipy
+seaborn
+networkx
+yfinance
+statsmodels

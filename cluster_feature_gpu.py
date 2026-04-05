@@ -31,13 +31,14 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 from sklearn.preprocessing import StandardScaler
 import joblib, datasets, pickle  # noqa: F401  (pickle re-import for type checkers)
+from typing import Optional
 
 torch.backends.cuda.matmul.allow_tf32 = True  # MI250-X likes TF32
 
 # ───────────────────────── helpers ─────────────────────────
 _latent_re = re.compile(r"latent(\d+)", re.I)
 
-def extract_latent(fn: str) -> int | None:
+def extract_latent(fn: str) -> Optional[int]:
     m = _latent_re.search(fn)
     return int(m.group(1)) if m else None
 
