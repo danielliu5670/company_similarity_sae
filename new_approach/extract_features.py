@@ -13,7 +13,7 @@ from tqdm import tqdm
 import cupy as cp
 
 """
-These are all the command-line arguments that can be passed into the file.
+These are all the command-line arguments that can be passed into the file. 
 """
 
 P = argparse.ArgumentParser()

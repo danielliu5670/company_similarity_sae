@@ -454,7 +454,7 @@ mc_uw_B_all, mc_pw_B_all, _ = evaluate_clusters(pair_lookup, all_cl_B)
 del msts_B; gc.collect()
 
 """
-This section determines the mean correlation and other metrics for the SCI baseline.
+This section determines the mean correlation and other metrics for the SIC baseline.
 Since it doesn't have the same structure as the other methods, we simply construct
 clusters where each one matches in SIC code, but use the same metrics.
 """
