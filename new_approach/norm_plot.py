@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""
-Plot: norm product vs. dot product similarity (description length check).
-
-Produces two figures:
-  1. Hexbin density plot (recommended for ~15M pairs)
-  2. Scatter with very low alpha (optional, --scatter flag)
-
-Saves to --out-dir (default: current directory).
-
-Usage (Colab):
-    !python plot_norm_vs_similarity.py \
-        --features-pkl /content/drive/MyDrive/company_similarity_sae/data/llama_features.pkl \
-        --load-model /content/drive/MyDrive/company_similarity_sae/data/llama_selection_model.pkl \
-        --top-k 1250 \
-        --out-dir /content/drive/MyDrive/company_similarity_sae/figures
-
-    # To also produce the scatter version:
-    !python plot_norm_vs_similarity.py \
-        --features-pkl ... --load-model ... --top-k 1250 --scatter
-"""
 
 import argparse
 import numpy as np
@@ -67,8 +47,6 @@ args = P.parse_args()
 
 os.makedirs(args.out_dir, exist_ok=True)
 
-# ---- Load features ----
-print("Loading features...")
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -88,8 +66,6 @@ if nan_mask.sum() > 0:
     df = df[~nan_mask].reset_index(drop=True)
     feat_matrix = feat_matrix[~nan_mask]
 
-# ---- Load model, select features ----
-print("Selecting features...")
 saved = joblib.load(args.load_model)
 scores = saved["scores"]
 ranked = np.argsort(scores)[::-1]
@@ -97,7 +73,6 @@ selected = ranked[:args.top_k]
 selected = selected[scores[selected] > 0]
 selected = np.sort(selected)
 n_selected = len(selected)
-print(f"  Selected {n_selected} features")
 
 selected_features = feat_matrix[:, selected].copy().astype(np.float32)
 weights = scores[selected].astype(np.float32)
@@ -107,20 +82,16 @@ feat_norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10).astype(np
 
 del feat_matrix; gc.collect()
 
-# ---- Load pairs ----
-print("Loading pairs...")
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
 
-# ---- Temporal split ----
 all_years = sorted(pairs_df["year"].unique())
 split_idx = int(0.75 * len(all_years))
 test_years = set(all_years[split_idx:])
 
-# ---- Map companies to indices ----
 company_ids = df["__index_level_0__"].values
 feat_idx_df = pd.DataFrame({
     "__index_level_0__": company_ids,
@@ -139,15 +110,11 @@ pairs_merged = pairs_merged.merge(
 
 if args.oos_only:
     pairs_merged = pairs_merged[pairs_merged["year"].isin(test_years)].reset_index(drop=True)
-    print(f"  Restricted to OOS years: {sorted(test_years)}")
 
 idx1 = pairs_merged["idx1"].values
 idx2 = pairs_merged["idx2"].values
 n_pairs = len(pairs_merged)
-print(f"  {n_pairs:,d} pairs")
 
-# ---- Compute dot product similarities ----
-print("Computing similarities...")
 sims = np.empty(n_pairs, dtype=np.float32)
 batch = args.pair_batch
 for s in range(0, n_pairs, batch):
@@ -155,25 +122,18 @@ for s in range(0, n_pairs, batch):
     i1, i2 = idx1[s:e], idx2[s:e]
     sims[s:e] = (selected_features[i1] * selected_features[i2]).sum(axis=1)
 
-# ---- Compute norm products ----
 norm_products = feat_norms[idx1] * feat_norms[idx2]
 
-# ---- Regression stats ----
 r_squared = np.corrcoef(norm_products, sims)[0, 1] ** 2
 rho, _ = spearmanr(norm_products, sims)
 slope = np.cov(norm_products, sims)[0, 1] / np.var(norm_products)
 intercept = sims.mean() - slope * norm_products.mean()
 
 subset_label = "OOS" if args.oos_only else "all years"
-print(f"\n  R² (norm product vs similarity): {r_squared:.4f}")
+print(f"\n  R²: {r_squared:.4f}")
 print(f"  Pearson r: {np.sqrt(r_squared):.4f}")
 print(f"  Spearman rho: {rho:.4f}")
-print(f"  Regression: sim = {slope:.6f} * norm_prod + {intercept:.4f}")
-
-# ==================================================================
-# Plot 1: Hexbin
-# ==================================================================
-print("\nGenerating hexbin plot...")
+print(f"  Regression: y = {slope:.6f} * x + {intercept:.4f}")
 
 fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -186,7 +146,6 @@ hb = ax.hexbin(
     linewidths=0.1,
 )
 
-# Regression line
 x_range = np.linspace(norm_products.min(), norm_products.max(), 200)
 y_pred = slope * x_range + intercept
 ax.plot(x_range, y_pred, color="red", linewidth=1.5, linestyle="--",
@@ -204,15 +163,9 @@ cb.set_label("Count (log scale)", fontsize=10)
 fig.tight_layout()
 out_hex = os.path.join(args.out_dir, "norm_vs_similarity_hexbin.png")
 fig.savefig(out_hex, dpi=args.dpi, bbox_inches="tight")
-print(f"  Saved: {out_hex}")
 plt.close(fig)
 
-# ==================================================================
-# Plot 2: Scatter (optional)
-# ==================================================================
 if args.scatter:
-    print("Generating scatter plot...")
-
     n_plot = min(args.scatter_sample, n_pairs)
     if n_plot < n_pairs:
         rng = np.random.default_rng(42)
@@ -245,7 +198,4 @@ if args.scatter:
     fig.tight_layout()
     out_scat = os.path.join(args.out_dir, "norm_vs_similarity_scatter.png")
     fig.savefig(out_scat, dpi=args.dpi, bbox_inches="tight")
-    print(f"  Saved: {out_scat}")
     plt.close(fig)
-
-print("\nDone.")

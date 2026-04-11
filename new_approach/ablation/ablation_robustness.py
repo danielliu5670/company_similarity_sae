@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Robustness checks for supervised SAE approach (GPU-accelerated):
-  1. Exclude 2020 from OOS evaluation (COVID-19 correlation spike)
-  2. Norm residualization (separate content signal from magnitude)
-  3. Per-year OOS breakdown
-
-Usage (Colab):
-    !pip install cupy-cuda12x tabulate
-    !python ablation_robustness.py \
-        --features-pkl /content/drive/MyDrive/company_similarity_sae/data/llama_features.pkl \
-        --load-model /content/drive/MyDrive/company_similarity_sae/data/llama_selection_model.pkl \
-        --top-k 1250
-"""
 
 import argparse
 import numpy as np
@@ -48,7 +35,6 @@ args = P.parse_args()
 
 PCTS = [0.5, 1.0, 2.0, 5.0, 10.0]
 
-# ---- Load data (same as evaluate.py) ----
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -68,7 +54,6 @@ if nan_mask.sum() > 0:
     df = df[~nan_mask].reset_index(drop=True)
     feat_matrix = feat_matrix[~nan_mask]
 
-# ---- Load model, select features ----
 saved = joblib.load(args.load_model)
 scores = saved["scores"]
 ranked = np.argsort(scores)[::-1]
@@ -85,20 +70,17 @@ feat_norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10).astype(np
 
 del feat_matrix; gc.collect()
 
-# ---- Load pairs ----
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
 
-# ---- Temporal split ----
 all_years = sorted(pairs_df["year"].unique())
 split_idx = int(0.75 * len(all_years))
 test_years = set(all_years[split_idx:])
 test_years_no2020 = test_years - {2020}
 
-# ---- Map companies to indices ----
 company_ids = df["__index_level_0__"].values
 feat_idx_df = pd.DataFrame({
     "__index_level_0__": company_ids,
@@ -120,7 +102,6 @@ idx2 = pairs_merged["idx2"].values.astype(np.int64)
 correlations = pairs_merged["correlation"].values.astype(np.float32)
 n_pairs = len(pairs_merged)
 
-# ---- Compute similarities on GPU (dot product, alpha=0) ----
 sel_gpu = cp.asarray(selected_features)
 idx1_gpu = cp.asarray(idx1)
 idx2_gpu = cp.asarray(idx2)
@@ -137,16 +118,11 @@ for s in range(0, n_pairs, pair_batch):
 del sel_gpu, idx1_gpu, idx2_gpu
 cp.get_default_memory_pool().free_all_blocks()
 
-# ================================================================
-# Compute metrics and build output
-# ================================================================
-
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
 
 def _fix_separators(table_str):
-    """Fix SEPARATING_LINE rendering in simple_outline format."""
     lines = table_str.split('\n')
     sep = None
     for line in lines:
@@ -180,25 +156,20 @@ def _cell(val, is_best):
     s = _fmt(val)
     return _bold(s) if is_best else s
 
-
-# ---- Masks ----
 test_mask_full = pairs_merged["year"].isin(test_years).values
 test_mask_no2020 = pairs_merged["year"].isin(test_years_no2020).values
 mask_2020 = pairs_merged["year"].eq(2020).values
 
-# ---- Baseline OOS ----
 test_sims = sims[test_mask_full]
 test_corrs = correlations[test_mask_full]
 rho_baseline, _ = spearmanr(test_sims, test_corrs)
 sorted_baseline = np.argsort(test_sims)[::-1]
 
-# ---- OOS excluding 2020 ----
 sims_no2020 = sims[test_mask_no2020]
 corrs_no2020 = correlations[test_mask_no2020]
 rho_no2020, _ = spearmanr(sims_no2020, corrs_no2020)
 sorted_no2020 = np.argsort(sims_no2020)[::-1]
 
-# ---- Norm residualization ----
 norm_products = feat_norms[idx1] * feat_norms[idx2]
 test_norm_prods = norm_products[test_mask_full]
 corr_sim_norm = np.corrcoef(sims, norm_products)[0, 1]
@@ -209,15 +180,12 @@ r_squared = 1 - np.var(residuals_test) / np.var(test_sims)
 rho_resid, _ = spearmanr(residuals_test, test_corrs)
 sorted_resid = np.argsort(residuals_test)[::-1]
 
-# ---- Population means ----
 pop_mean_full = test_corrs.mean()
 pop_mean_no2020 = corrs_no2020.mean()
 
-# ---- 2020 statistics ----
 n_test = test_mask_full.sum()
 n_2020 = mask_2020.sum()
 
-# ---- Collect lifts per condition ----
 conditions = [
     ("OOS baseline", rho_baseline, sorted_baseline, test_corrs),
     ("OOS excl. 2020", rho_no2020, sorted_no2020, corrs_no2020),
@@ -231,12 +199,10 @@ for name, _rho, srt, corrs in conditions:
         n_top = max(1, int(len(corrs) * pct / 100.0))
         lifts[name][pct] = corrs[srt[:n_top]].mean()
 
-# ---- Determine best values ----
 all_rhos = [c[1] for c in conditions]
 best_rho = max(all_rhos)
 best_lift = {pct: max(lifts[n][pct] for n, _, _, _ in conditions) for pct in PCTS}
 
-# ---- Build main table ----
 rows = []
 for name, rho, _srt, _corrs in conditions:
     for i, pct in enumerate(PCTS):
@@ -257,7 +223,6 @@ table_main = _fix_separators(tabulate(rows,
                       headers=["Method", "Spearman rho", "Cutoff", "Mean correlation"],
                       tablefmt="simple_outline"))
 
-# ---- Build per-year table ----
 year_data = []
 for year in sorted(test_years):
     ymask = pairs_merged["year"].eq(year).values
@@ -289,7 +254,6 @@ table_years = tabulate(year_rows,
                        tablefmt="simple_outline",
                        colalign=("right", "right", "right", "right", "right"))
 
-# ---- Print output ----
 print(table_main)
 print(f"\nBy Year (OOS):")
 print(table_years)

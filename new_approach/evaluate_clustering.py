@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Clustering evaluation: our approach vs. parent paper vs. SIC baseline.
-Replicates the parent paper's MST + theta-sweep pipeline and evaluates under
-both their unweighted MC(Gk) metric (each cluster weighted equally) and a
-pair-weighted variant (each intra-cluster pair weighted equally).
-
-Usage (Colab):
-    !pip install tabulate
-    !python evaluate_clustering.py \
-        --features-pkl /content/drive/MyDrive/company_similarity_sae/data/llama_features.pkl \
-        --load-model /content/drive/MyDrive/company_similarity_sae/data/llama_selection_model.pkl \
-        --top-k 1250
-"""
 
 import argparse
 import numpy as np
@@ -33,13 +20,7 @@ def unwrap_feature(x):
         return x.astype(np.float32).flatten()
     return np.array(x, dtype=np.float32).flatten()
 
-
-# ================================================================
-# Clustering utilities
-# ================================================================
-
 def build_msts(pairs_df, years, distance_col):
-    """Build one MST per year from pairwise distances."""
     msts = {}
     for year in tqdm(years, desc="Building MSTs"):
         ydf = pairs_df[pairs_df["year"] == year]
@@ -60,7 +41,6 @@ def build_msts(pairs_df, years, distance_col):
 
 
 def clusters_at_theta(mst, theta):
-    """Cut MST edges above theta, return {id: [companies]}."""
     if mst is None:
         return {}
     g = mst.copy()
@@ -74,7 +54,6 @@ def clusters_at_theta(mst, theta):
 
 
 def build_pair_lookup(pairs_df, years):
-    """Precompute {year: {frozenset: correlation}} for fast cluster eval."""
     lookup = {}
     for year in years:
         ydf = pairs_df[pairs_df["year"] == year]
@@ -89,11 +68,6 @@ def build_pair_lookup(pairs_df, years):
 
 
 def evaluate_year_clusters(ylookup, clusters):
-    """
-    Evaluate clusters for one year.
-    Returns (mc_unweighted, mc_pair_weighted, n_multi_clusters,
-             n_intra_pairs, cluster_sizes).
-    """
     cluster_means = []
     cluster_sizes = []
     total_corr = 0.0
@@ -120,7 +94,6 @@ def evaluate_year_clusters(ylookup, clusters):
 
 
 def evaluate_clusters(pair_lookup, year_clusters):
-    """Evaluate over multiple years. Returns (mc_uw, mc_pw, details)."""
     uw_vals, pw_vals = [], []
     details = []
 
@@ -152,10 +125,6 @@ def evaluate_clusters(pair_lookup, year_clusters):
 
 
 def sweep_theta(msts, pair_lookup, years, thetas):
-    """
-    Sweep theta on given years, optimizing unweighted MC(Gk).
-    Returns (best_theta, sweep_results).
-    """
     best_theta = None
     best_mc = -np.inf
     results = []
@@ -177,11 +146,6 @@ def sweep_theta(msts, pair_lookup, years, thetas):
 
     return best_theta, results
 
-
-# ================================================================
-# Main
-# ================================================================
-
 P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
 P.add_argument("--load-model", required=True)
@@ -202,8 +166,6 @@ P.add_argument(
 P.add_argument("--original-pairs-ds", default="v1ctor10/cos_sim_4000pca_exp")
 args = P.parse_args()
 
-
-# ---- Load shared data ----
 raw = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = raw.dropna(subset=["correlation", "cosine_similarity"]).copy()
 pairs_df["year"] = pairs_df["year"].astype(int)
@@ -221,8 +183,6 @@ df_c = load_dataset(args.cov_ds)["train"].to_pandas()
 df_c["__index_level_0__"] = df_c["__index_level_0__"].astype(str)
 df_c["year"] = df_c["year"].astype(int)
 
-
-# ---- Load features + model ----
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -253,7 +213,6 @@ if args.score_weight:
 norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10).astype(np.float32)
 del feat_matrix; gc.collect()
 
-# Map companies to feature indices
 company_ids = df["__index_level_0__"].values
 feat_idx_df = pd.DataFrame({
     "__index_level_0__": company_ids,
@@ -261,8 +220,6 @@ feat_idx_df = pd.DataFrame({
     "feat_idx": np.arange(len(df)),
 })
 
-
-# ---- Merge to common pair set ----
 pairs_merged = pairs_df.merge(
     feat_idx_df.rename(columns={
         "__index_level_0__": "Company1", "feat_idx": "idx1",
@@ -276,8 +233,6 @@ pairs_merged = pairs_merged.merge(
     on=["Company2", "year"], how="inner",
 )
 
-
-# ---- Compute our similarities ----
 idx1 = pairs_merged["idx1"].values
 idx2 = pairs_merged["idx2"].values
 alpha = args.norm_alpha
@@ -296,8 +251,6 @@ for s in range(0, len(pairs_merged), batch):
 pairs_merged["sim_ours"] = sims_ours
 del selected_features; gc.collect()
 
-
-# ---- Convert to distances and standardize ----
 pairs_merged["dist_pca"] = (
     1.0 - pairs_merged["cosine_similarity"].values
 ).astype(np.float32)
@@ -317,8 +270,6 @@ pairs_merged["dist_ours_s"] = scaler_B.transform(
     pairs_merged[["dist_ours"]]
 ).astype(np.float32).ravel()
 
-
-# ---- Precompute pair lookup ----
 pair_lookup = build_pair_lookup(pairs_merged, all_years)
 
 thetas = np.arange(
@@ -326,10 +277,6 @@ thetas = np.arange(
 )
 thetas = np.round(thetas, 2)
 
-
-# ================================================================
-# METHOD A: Parent paper (PCA cosine similarity)
-# ================================================================
 print("\nParent paper:")
 
 msts_A = build_msts(pairs_merged, all_years, "dist_pca_s")
@@ -338,11 +285,8 @@ best_theta_A, sweep_A = sweep_theta(
 )
 
 if best_theta_A is None:
-    print("  WARNING: no valid theta found for parent paper.")
+    print("  No theta found.")
     best_theta_A = thetas[len(thetas) // 2]
-elif best_theta_A == thetas[0] or best_theta_A == thetas[-1]:
-    print(f"  WARNING: best theta at boundary ({best_theta_A:.2f}), "
-          "consider expanding range.")
 
 test_cl_A = [
     (y, clusters_at_theta(msts_A[y], best_theta_A))
@@ -359,10 +303,6 @@ all_cl_A = [
 mc_uw_A_all, mc_pw_A_all, _ = evaluate_clusters(pair_lookup, all_cl_A)
 del msts_A; gc.collect()
 
-
-# ================================================================
-# METHOD B: Our approach (supervised SAE)
-# ================================================================
 print(f"\nNew method:")
 
 msts_B = build_msts(pairs_merged, all_years, "dist_ours_s")
@@ -371,11 +311,8 @@ best_theta_B, sweep_B = sweep_theta(
 )
 
 if best_theta_B is None:
-    print("  WARNING: no valid theta found for our approach.")
+    print("  No theta found.")
     best_theta_B = thetas[len(thetas) // 2]
-elif best_theta_B == thetas[0] or best_theta_B == thetas[-1]:
-    print(f"  WARNING: best theta at boundary ({best_theta_B:.2f}), "
-          "consider expanding range.")
 
 test_cl_B = [
     (y, clusters_at_theta(msts_B[y], best_theta_B))
@@ -391,11 +328,6 @@ all_cl_B = [
 ]
 mc_uw_B_all, mc_pw_B_all, _ = evaluate_clusters(pair_lookup, all_cl_B)
 del msts_B; gc.collect()
-
-
-# ================================================================
-# METHOD C: SIC code baseline
-# ================================================================
 
 sic_info = df_c[["__index_level_0__", "year", "sic_code"]].dropna(
     subset=["sic_code"]
@@ -422,12 +354,6 @@ mc_uw_C_all, mc_pw_C_all, _ = evaluate_clusters(
     pair_lookup, sic_year_clusters
 )
 
-
-# ================================================================
-# Report
-# ================================================================
-
-# Helper: bold the row with the highest OOS value
 def _bold_best(rows, oos_col_idx=1):
     best_val = max(float(r[oos_col_idx]) for r in rows)
     out = []
@@ -438,7 +364,6 @@ def _bold_best(rows, oos_col_idx=1):
             out.append(list(r))
     return out
 
-# Table 1: Unweighted MC(Gk)
 print(f"\nUnweighted MC(Gk)")
 uw_table = [
     ["New method",
@@ -456,7 +381,6 @@ print(tabulate(
     tablefmt="simple_outline",
 ))
 
-# Table 2: Weighted MC(Gk)
 print(f"\nWeighted MC(Gk)")
 pw_table = [
     ["New method",
@@ -475,7 +399,6 @@ print(tabulate(
 ))
 
 
-# Per-year breakdowns
 def print_yearly(label, details):
     print(f"\n{label}")
     rows = []

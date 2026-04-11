@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Supervised feature selection + cosine similarity.
-Replaces unsupervised PCA with feature scoring against return correlations.
-
-Usage (Colab):
-    !python compute_similarities_gemma.py \
-        --features-pkl /content/drive/MyDrive/company_similarity_sae/data/gemma_features.pkl \
-        --top-k 500 \
-        --out-pairs /content/drive/MyDrive/company_similarity_sae/data/gemma_pairs.pkl \
-        --out-model /content/drive/MyDrive/company_similarity_sae/data/gemma_selection_model.pkl
-"""
 
 import argparse
 import os
@@ -48,9 +37,6 @@ args = P.parse_args()
 
 os.makedirs(os.path.dirname(args.out_pairs) or ".", exist_ok=True)
 
-# ------------------------------------------------------------------
-# Load and unwrap features (identical to original)
-# ------------------------------------------------------------------
 df_f = pd.read_pickle(args.features_pkl)
 
 
@@ -64,9 +50,6 @@ def unwrap_feature(x):
 
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 
-# ------------------------------------------------------------------
-# Merge with company metadata (identical to original)
-# ------------------------------------------------------------------
 df_c = load_dataset(args.cov_ds)["train"].to_pandas()
 
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -87,36 +70,23 @@ if len(feat_matrix) == 0:
 
 feat_dim = feat_matrix.shape[1]
 
-# ------------------------------------------------------------------
-# Load pairs dataset
-# ------------------------------------------------------------------
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
 
-# ------------------------------------------------------------------
-# Temporal split (must match threshold_gemma.py)
-# ------------------------------------------------------------------
 all_years = sorted(pairs_df["year"].unique())
 n_total = len(all_years)
 split_idx = int(0.75 * n_total)
 train_years = set(all_years[:split_idx])
 test_years = set(all_years[split_idx:])
 
-# ------------------------------------------------------------------
-# Map companies to row indices in feat_matrix
-# ------------------------------------------------------------------
 company_ids = df["__index_level_0__"].values
 company_to_idx = {c: i for i, c in enumerate(company_ids)}
 
-# ------------------------------------------------------------------
-# Build index arrays for TRAINING pairs only
-# ------------------------------------------------------------------
 train_pairs = pairs_df[pairs_df["year"].isin(train_years)].copy()
 
-# Keep only pairs where both companies have features
 valid_mask = (
     train_pairs["Company1"].isin(company_to_idx)
     & train_pairs["Company2"].isin(company_to_idx)
@@ -128,22 +98,13 @@ idx2_train = train_pairs["Company2"].map(company_to_idx).values.astype(np.int64)
 corr_train = train_pairs["correlation"].values.astype(np.float32)
 pop_mean = corr_train.mean()
 
-# ------------------------------------------------------------------
-# Feature scoring: either load pre-computed or run from scratch
-# ------------------------------------------------------------------
 if args.load_model is not None:
     saved = joblib.load(args.load_model)
     scores = saved["scores"]
     support = saved["support"]
 else:
-    # ------------------------------------------------------------------
-    # Binarize features: active = nonzero after JumpReLU
-    # ------------------------------------------------------------------
     binary_matrix = (feat_matrix > 0)
 
-    # ------------------------------------------------------------------
-    # Score each feature against return correlations (GPU)
-    # ------------------------------------------------------------------
     scores = np.zeros(feat_dim, dtype=np.float64)
     support = np.zeros(feat_dim, dtype=np.int64)
 
@@ -180,9 +141,6 @@ else:
     del binary_gpu, idx1_gpu, idx2_gpu, corr_gpu
     cp.get_default_memory_pool().free_all_blocks()
 
-# ------------------------------------------------------------------
-# Match all pairs to feature indices 
-# ------------------------------------------------------------------
 feat_df = pd.DataFrame({
     "__index_level_0__": company_ids,
     "year": df["year"].values,
@@ -204,16 +162,10 @@ idx1 = pairs_merged["idx1"].values
 idx2 = pairs_merged["idx2"].values
 correlations = pairs_merged["correlation"].values
 
-# ------------------------------------------------------------------
-# Sweep over top-k values
-# ------------------------------------------------------------------
 ranked = np.argsort(scores)[::-1]
 summary_rows = []
 pct_thresholds = [0.5, 1.0, 2.0, 5.0, 10.0]
 
-# ------------------------------------------------------------------
-# SIC baseline
-# ------------------------------------------------------------------
 sic_values = df["sic_code"].values
 sic_strs = np.array([str(int(float(s))).zfill(4) for s in sic_values])
 sic_chars = np.array([[c for c in s] for s in sic_strs])
@@ -229,9 +181,6 @@ sic_sorted = np.argsort(sic_test_sims)[::-1]
 sic_n_top = max(1, int(len(sic_test_sims) * 1.0 / 100.0))
 sic_oos_top1 = test_corrs_all[sic_sorted[:sic_n_top]].mean()
 
-# ------------------------------------------------------------------
-# Table rendering helpers
-# ------------------------------------------------------------------
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
@@ -289,7 +238,6 @@ for top_k in args.top_k:
     if len(selected) == 0:
         continue
 
-    # Extract and optionally score-weight
     selected_features = feat_matrix[:, selected].copy()
     if args.score_weight:
         weights = scores[selected].astype(np.float32)
@@ -305,7 +253,6 @@ for top_k in args.top_k:
         else:
             norm_factors = raw_norms ** alpha
 
-        # Compute similarities
         cos_sims = np.empty(len(pairs_merged), dtype=np.float32)
         batch = 500_000
         for s in range(0, len(pairs_merged), batch):
@@ -318,14 +265,12 @@ for top_k in args.top_k:
 
         rho, pval = spearmanr(cos_sims, correlations)
 
-        # Precision-at-k (all pairs)
         sorted_indices = np.argsort(cos_sims)[::-1]
         all_prec = {}
         for pct in pct_thresholds:
             n_top = max(1, int(len(cos_sims) * pct / 100.0))
             all_prec[pct] = correlations[sorted_indices[:n_top]].mean()
 
-        # Precision-at-k (OOS only)
         test_mask = pairs_merged["year"].isin(test_years).values
         test_sims = cos_sims[test_mask]
         test_corrs = correlations[test_mask]
@@ -349,7 +294,6 @@ for top_k in args.top_k:
             "spearman_rho": rho, "oos_top1pct_corr": oos_top1_corr,
         })
 
-        # Save pairs for this k and alpha
         out_pairs_df = pairs_merged.drop(columns=["idx1", "idx2"]).copy()
         out_pairs_df["cosine_similarity"] = cos_sims
 
@@ -363,9 +307,6 @@ for top_k in args.top_k:
 
     render_detail_table(top_k, table_rows, pct_thresholds)
 
-# ------------------------------------------------------------------
-# Save model (scores array for future --load-model runs)
-# ------------------------------------------------------------------
 model_bundle = {
     "selected_indices": selected,
     "scaler": None,
@@ -379,9 +320,6 @@ model_bundle = {
 }
 joblib.dump(model_bundle, args.out_model)
 
-# ------------------------------------------------------------------
-# Summary table
-# ------------------------------------------------------------------
 if summary_rows:
     best_by_k = defaultdict(lambda: -np.inf)
     for r in summary_rows:

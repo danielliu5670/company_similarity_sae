@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-Unified precision-at-k evaluation: our approach, parent paper, SIC baseline.
-
-Usage (Colab):
-    !python unified_eval.py \
-        --features-pkl /content/drive/MyDrive/company_similarity_sae/data/llama_features.pkl \
-        --load-model /content/drive/MyDrive/company_similarity_sae/data/llama_selection_model.pkl \
-        --top-k 1000
-"""
 
 import argparse
 import numpy as np
@@ -49,8 +40,6 @@ args = P.parse_args()
 
 PCTS = [0.5, 1.0, 2.0, 5.0, 10.0]
 
-# Load shared data
-
 raw = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 
 ds = raw.dropna(subset=["correlation", "cosine_similarity"]).copy()
@@ -73,8 +62,6 @@ df_c = load_dataset(args.cov_ds)["train"].to_pandas()
 df_c["__index_level_0__"] = df_c["__index_level_0__"].astype(str)
 df_c["year"] = df_c["year"].astype(int)
 
-# A: Parent paper (PCA 4000-dim cosine similarity)
-
 cos_sims_A = ds["cosine_similarity"].values.astype(np.float32)
 corrs_A = ds["correlation"].values.astype(np.float32)
 rho_A, pval_A = spearmanr(cos_sims_A, corrs_A)
@@ -88,8 +75,6 @@ prec_A = {}
 for pct in PCTS:
     n_top = max(1, int(len(test_sims_A) * pct / 100.0))
     prec_A[pct] = test_corrs_A[test_sorted_A[:n_top]].mean()
-
-# B: Our approach (supervised SAE feature selection)
 
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
@@ -168,8 +153,6 @@ for pct in PCTS:
 del feat_matrix, selected_features
 gc.collect()
 
-# C: SIC industry code baseline
-
 sic_info = df_c[["__index_level_0__", "year", "sic_code"]].dropna(subset=["sic_code"]).copy()
 sic_dedup = sic_info.drop_duplicates(subset=["__index_level_0__", "year"], keep="last")
 
@@ -190,8 +173,6 @@ n_same_test = int(same_sic_test.sum())
 n_total_test_sic = len(ds_sic_test)
 pct_same_test = 100.0 * n_same_test / n_total_test_sic
 sic_corr_test = ds_sic_test.loc[same_sic_test, "correlation"].mean()
-
-# D: Vamvourellis et al. (SBERT embedding cosine similarity)
 
 rho_D = pval_D = None
 prec_D = {}
@@ -251,8 +232,6 @@ if args.sbert_pkl:
     del sbert_matrix, df_sbert, df_sb
     gc.collect()
 
-# Results
-
 BOLD = "\033[1m"
 RESET = "\033[0m"
 yr_min, yr_max = min(test_years), max(test_years)
@@ -298,7 +277,7 @@ for pct in PCTS:
     prec_table.append(row)
 
 print()
-print("Spearman rank correlation (all years)")
+print("Spearman rho (all years)")
 print(tabulate(
     spearman_table,
     headers=["Approach", "Spearman rho", "p-value"],
@@ -306,7 +285,7 @@ print(tabulate(
 ))
 
 print()
-print(f"Mean return correlation, OOS {yr_min}-{yr_max}")
+print(f"Correlation-at-k, OOS {yr_min}-{yr_max}")
 print(tabulate(
     prec_table,
     headers=prec_headers,
@@ -314,16 +293,11 @@ print(tabulate(
 ))
 
 print()
-print(f"Population mean return correlation: {pop_corr:.4f}")
+print(f"Population mean correlation: {pop_corr:.4f}")
 print()
 print(f"New approach: k={n_selected}, "
       f"score-weighted={'yes' if args.score_weight else 'no'}, "
       f"\u03b1={args.norm_alpha}; "
       f"{len(test_sims_B):,d} OOS pairs")
-print(f"Parent paper: PCA 4000-dim cosine; "
+print(f"Original approach: PCA 4000-dim cosine; "
       f"{len(test_sims_A):,d} OOS pairs")
-if n_test_D > 0:
-    print(f"Vamvourellis: SBERT all-mpnet-base-v2 cosine; "
-          f"{n_test_D:,d} OOS pairs")
-print(f"SIC: {n_same_test:,d} same-code / "
-      f"{n_total_test_sic:,d} ({pct_same_test:.1f}%)")
