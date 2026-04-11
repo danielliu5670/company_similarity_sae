@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+
+"""initial setup imports"""
 import argparse
 import numpy as np
 import pandas as pd
@@ -10,6 +12,8 @@ from scipy.stats import spearmanr
 from tabulate import tabulate, SEPARATING_LINE
 import gc
 
+
+"""helper function to unwrap features from the dataframe, ensuring they are in the correct format for further processing."""
 def unwrap_feature(x):
     while hasattr(x, '__len__') and len(x) == 1:
         x = x[0]
@@ -17,7 +21,7 @@ def unwrap_feature(x):
         return x.astype(np.float32).flatten()
     return np.array(x, dtype=np.float32).flatten()
 
-
+"""Argument parsing to specify input files, model loading, and parameters for the analysis."""
 P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
 P.add_argument("--load-model", required=True)
@@ -35,6 +39,10 @@ args = P.parse_args()
 
 PCTS = [0.5, 1.0, 2.0, 5.0, 10.0]
 
+"""The script begins by loading the features from a pickle file and the covariate dataset using the Hugging Face datasets library. 
+The features are unwrapped and converted to a suitable format, while the covariate dataset is merged with the features based on a common index.
+ The script ensures that any rows with missing SIC codes are dropped,
+ and the year column is properly formatted as integers."""
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -48,12 +56,18 @@ df = df.dropna(subset=["sic_code"])
 df["year"] = df["year"].astype(int)
 del df_f; gc.collect()
 
+"""The features are extracted into a matrix, 
+and any rows containing NaN or infinite values are removed to ensure the integrity of the data for subsequent analysis."""
 feat_matrix = np.vstack(df["features"].values)
 nan_mask = np.isnan(feat_matrix).any(axis=1) | np.isinf(feat_matrix).any(axis=1)
 if nan_mask.sum() > 0:
     df = df[~nan_mask].reset_index(drop=True)
     feat_matrix = feat_matrix[~nan_mask]
 
+"""The pre-trained model is loaded using joblib, and the scores for each feature dimension are extracted.
+ The feature dimensions are ranked based on their scores, 
+ and the top-k dimensions with positive scores are selected for further analysis. 
+ The selected features are then weighted by their corresponding scores to create a new feature representation that emphasizes the most relevant dimensions according to the model's scoring."""
 saved = joblib.load(args.load_model)
 scores = saved["scores"]
 ranked = np.argsort(scores)[::-1]
@@ -62,25 +76,37 @@ selected = selected[scores[selected] > 0]
 selected = np.sort(selected)
 n_selected = len(selected)
 
+
 selected_features = feat_matrix[:, selected].copy().astype(np.float32)
 weights = scores[selected].astype(np.float32)
 selected_features *= weights[np.newaxis, :]
 
+"""features are normalized and selected to do cosine similarity"""
 feat_norms = np.linalg.norm(selected_features, axis=1).clip(min=1e-10).astype(np.float32)
 
 del feat_matrix; gc.collect()
 
+"""The original pairs dataset is loaded, 
+and any rows with missing correlation values are dropped. 
+The year and company identifiers are properly formatted, 
+and the dataset is merged with the feature index to associate each company in the pairs with its corresponding feature index. 
+This allows for efficient retrieval of the selected features for each company when computing the similarity scores for the pairs."""
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
 
+"""train test split based on years"""
 all_years = sorted(pairs_df["year"].unique())
 split_idx = int(0.75 * len(all_years))
 test_years = set(all_years[split_idx:])
 test_years_no2020 = test_years - {2020}
 
+"""The company identifiers from the features dataframe are extracted, 
+and a new dataframe is created to map each company and year to its corresponding feature index.
+ This mapping is then merged with the pairs dataset to associate each company in the pairs with its feature index, 
+ allowing for efficient retrieval of the selected features for each company when computing the similarity scores for the pairs."""
 company_ids = df["__index_level_0__"].values
 feat_idx_df = pd.DataFrame({
     "__index_level_0__": company_ids,
@@ -102,11 +128,16 @@ idx2 = pairs_merged["idx2"].values.astype(np.int64)
 correlations = pairs_merged["correlation"].values.astype(np.float32)
 n_pairs = len(pairs_merged)
 
+
 sel_gpu = cp.asarray(selected_features)
 idx1_gpu = cp.asarray(idx1)
 idx2_gpu = cp.asarray(idx2)
 sims = np.empty(n_pairs, dtype=np.float32)
 
+"""The similarity scores for all pairs are computed using the selected features. 
+The computation is done in batches to manage memory usage, 
+where the dot product of the selected features for the two companies in each pair is calculated to obtain the similarity score. 
+The scores are stored in a NumPy array, and the GPU memory is freed after the computation to ensure efficient resource management"""
 pair_batch = args.pair_batch
 for s in range(0, n_pairs, pair_batch):
     e = min(s + pair_batch, n_pairs)
@@ -118,6 +149,7 @@ for s in range(0, n_pairs, pair_batch):
 del sel_gpu, idx1_gpu, idx2_gpu
 cp.get_default_memory_pool().free_all_blocks()
 
+"""this makes the results tables"""
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
@@ -155,6 +187,7 @@ def _bold(s):
 def _cell(val, is_best):
     s = _fmt(val)
     return _bold(s) if is_best else s
+
 
 test_mask_full = pairs_merged["year"].isin(test_years).values
 test_mask_no2020 = pairs_merged["year"].isin(test_years_no2020).values

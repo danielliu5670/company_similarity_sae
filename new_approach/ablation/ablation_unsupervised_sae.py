@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+"""initial imports"""
 import argparse
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ from scipy.stats import spearmanr
 from tabulate import tabulate, SEPARATING_LINE
 import gc
 
+"""helper function to unwrap features from the dataframe and convert to numpy arrays"""
 def unwrap_feature(x):
     while hasattr(x, '__len__') and len(x) == 1:
         x = x[0]
@@ -16,7 +18,7 @@ def unwrap_feature(x):
         return x.astype(np.float32).flatten()
     return np.array(x, dtype=np.float32).flatten()
 
-
+"""argument parsing"""
 P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
 P.add_argument("--feat-chunk", type=int, default=4096,
@@ -49,7 +51,9 @@ P.add_argument("--parent-lifts-all", type=str, default=None,
                help="Comma-separated all-years lift values for parent paper")
 args = P.parse_args()
 
+"""percentage cutoffs"""
 PCTS = [0.5, 1.0, 2.0, 5.0, 10.0]
+"""makes table"""
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
@@ -81,11 +85,23 @@ def _parse_lifts(csv_str):
     assert len(vals) == len(PCTS), f"Expected {len(PCTS)} lift values, got {len(vals)}"
     return dict(zip(PCTS, vals))
 
+"""The script begins by importing necessary libraries and defining a helper function to unwrap features from the dataframe.
+ It then sets up argument parsing to allow for flexible input of various parameters and datasets. 
+ The percentage cutoffs for evaluating the lifts are defined, and a function is provided to fix the separators in the results table for better readability."""
 sae_lifts_oos = _parse_lifts(args.sae_lifts_oos)
 sae_lifts_all = _parse_lifts(args.sae_lifts_all)
 parent_lifts_oos = _parse_lifts(args.parent_lifts_oos)
 parent_lifts_all = _parse_lifts(args.parent_lifts_all)
 
+"""The features dataframe is loaded from a pickle file, 
+and the features are unwrapped using the helper function. 
+The company identifiers are converted to strings for consistent merging later on. 
+ The covariate dataset is loaded using the Hugging Face datasets library, 
+ and the relevant columns are formatted appropriately. 
+ The two dataframes are merged on the company identifier, 
+ and any rows with missing SIC codes are dropped. 
+ The year column is ensured to be of integer type, 
+ and the original features dataframe is deleted to free up memory."""
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -99,6 +115,8 @@ df = df.dropna(subset=["sic_code"])
 df["year"] = df["year"].astype(int)
 del df_f; gc.collect()
 
+"""The features are extracted into a NumPy array, and any rows containing NaN or infinite values are removed to ensure clean data for similarity computations.
+ The number of companies and the feature dimensionality are determined from the shape of the feature matrix."""
 feat_matrix = np.vstack(df["features"].values)
 nan_mask = np.isnan(feat_matrix).any(axis=1) | np.isinf(feat_matrix).any(axis=1)
 if nan_mask.sum() > 0:
@@ -107,19 +125,27 @@ if nan_mask.sum() > 0:
 
 n_companies, feat_dim = feat_matrix.shape
 
+"""The L2 norms of the feature vectors are computed and clipped to avoid division by zero when calculating cosine similarities later on.
+ The original pairs dataset is loaded, and any rows with missing correlation values are dropped. 
+ The year and company identifiers are properly formatted, and the dataset is merged with the feature index to associate each company in the pairs with its corresponding feature index. 
+ This allows for efficient retrieval of the selected features for each"""
 norms = np.linalg.norm(feat_matrix, axis=1).astype(np.float32)
 norms = np.clip(norms, 1e-10, None)
 
-pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
+
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
 
+"""year sorting and train test split"""
 all_years = sorted(pairs_df["year"].unique())
 split_idx = int(0.75 * len(all_years))
 test_years = set(all_years[split_idx:])
 
+"""The company identifiers from the features dataframe are extracted, and a new dataframe is created to map each company and year to its corresponding feature index. 
+ This mapping is then merged with the pairs dataset to associate each company in the pairs with its feature index, 
+ allowing for efficient retrieval of the selected features for each company when computing the similarity scores for the pairs."""
 company_ids = df["__index_level_0__"].values
 feat_idx_df = pd.DataFrame({
     "__index_level_0__": company_ids,
@@ -141,10 +167,16 @@ idx2 = pairs_merged["idx2"].values.astype(np.int64)
 correlations = pairs_merged["correlation"].values.astype(np.float32)
 n_pairs = len(pairs_merged)
 
+
 idx1_gpu = cp.asarray(idx1)
 idx2_gpu = cp.asarray(idx2)
 dot_sims_gpu = cp.zeros(n_pairs, dtype=cp.float32)
 
+"""The similarity scores for all pairs are computed using the original features.
+ The computation is done in batches to manage memory usage, 
+ where the dot product of the features for the two companies in each pair is calculated to obtain the similarity score.
+ The scores are stored in a GPU array, 
+and the GPU memory is freed after the computation to ensure efficient resource management."""
 feat_chunk = args.feat_chunk
 pair_batch = args.pair_batch
 n_feat_chunks = (feat_dim + feat_chunk - 1) // feat_chunk
@@ -178,6 +210,8 @@ cp.get_default_memory_pool().free_all_blocks()
 test_mask = pairs_merged["year"].isin(test_years).values
 test_corrs = correlations[test_mask]
 
+"""The script then computes the cosine similarity using the original features for all pairs. 
+The Spearman correlation is computed for both the entire dataset and the test set to evaluate the performance of"""
 test_dot = dot_sims[test_mask]
 test_cos = cos_sims[test_mask]
 test_sorted_dot = np.argsort(test_dot)[::-1]
@@ -190,6 +224,7 @@ all_sorted_cos = np.argsort(cos_sims)[::-1]
 rho_dot_all, _ = spearmanr(dot_sims, correlations)
 rho_cos_all, _ = spearmanr(cos_sims, correlations)
 
+"""formatting and table creation helper functions"""
 def _fmt(val):
     return f"{val:.4f}" if val is not None else "N/A"
 

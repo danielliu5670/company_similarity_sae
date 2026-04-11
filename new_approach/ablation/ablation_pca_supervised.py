@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+
+"""setting up imports for the ablation study of supervised PCA"""
 import argparse
 import numpy as np
 import pandas as pd
@@ -9,6 +11,11 @@ from scipy.stats import spearmanr
 from tabulate import tabulate, SEPARATING_LINE
 import gc
 
+
+"""this function unwraps the features from the dataframe,
+ ensuring they are in the correct format for PCA processing. 
+ It handles cases where the features might be nested within lists or arrays, 
+ and converts them to a flat numpy array of type float32."""
 def unwrap_feature(x):
     while hasattr(x, '__len__') and len(x) == 1:
         x = x[0]
@@ -17,6 +24,8 @@ def unwrap_feature(x):
     return np.array(x, dtype=np.float32).flatten()
 
 
+"""Argument parsing for the supervised PCA ablation study.
+This section defines the command-line arguments that can be passed to the script,"""
 P = argparse.ArgumentParser()
 P.add_argument("--features-pkl", required=True)
 P.add_argument("--top-k", type=int, default=1250)
@@ -42,6 +51,10 @@ args = P.parse_args()
 
 PCTS = [0.5, 1.0, 2.0, 5.0, 10.0]
 
+
+"""This function parses the comma-separated lift values provided as command-line arguments.
+It converts the string into a dictionary mapping each percentage cutoff to its corresponding lift value.
+If the input string is None, it returns None, indicating that no lift values were provided."""
 def _parse_lifts(csv_str):
     if csv_str is None:
         return None
@@ -52,6 +65,10 @@ def _parse_lifts(csv_str):
 sae_lifts_oos = _parse_lifts(args.sae_lifts_oos)
 sae_lifts_all = _parse_lifts(args.sae_lifts_all)
 
+
+"""This section loads the features and covariate datasets,
+ merges them on the company index, 
+ and prepares the feature matrix for PCA."""
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -65,27 +82,37 @@ df = df.dropna(subset=["sic_code"])
 df["year"] = df["year"].astype(int)
 del df_f; gc.collect()
 
+"""The feature matrix is constructed by stacking the 'features' column from the merged dataframe.
+Any rows containing NaN or infinite values are removed to ensure the integrity of the PCA process."""
 feat_matrix = np.vstack(df["features"].values)
 nan_mask = np.isnan(feat_matrix).any(axis=1) | np.isinf(feat_matrix).any(axis=1)
 if nan_mask.sum() > 0:
     df = df[~nan_mask].reset_index(drop=True)
     feat_matrix = feat_matrix[~nan_mask]
 
+"""PCA is performed on the cleaned feature matrix to reduce its dimensionality.
+The number of PCA components is determined by the --pca-dims argument,
+ and the 'randomized' SVD solver is used for efficiency."""
 pca = PCA(n_components=args.pca_dims, svd_solver="randomized", random_state=42)
 pca_features = pca.fit_transform(feat_matrix).astype(np.float32)
 
 del feat_matrix; gc.collect()
 
+"""The original pairs dataset is loaded,
+ and any rows with missing correlation values are dropped."""
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
 
+"""The dataset is split into training and testing sets based on the year."""
+
 all_years = sorted(pairs_df["year"].unique())
 split_idx = int(0.75 * len(all_years))
 train_years = set(all_years[:split_idx])
 test_years = set(all_years[split_idx:])
+
 
 company_ids = df["__index_level_0__"].values
 feat_idx_df = pd.DataFrame({
@@ -113,6 +140,10 @@ scores = np.zeros(args.pca_dims, dtype=np.float64)
 corr_train_demean = corr_train - corr_train.mean()
 corr_train_std = corr_train.std()
 
+"""The following loop computes a score for each PCA dimension based on the correlation between the product of the PCA features and the correlation values in the training set.
+For each PCA dimension, it calculates the product of the corresponding PCA features for the two companies in each pair, demeans it,
+ and then computes a score that reflects how well this product correlates with the demeaned correlation values.
+ The score is normalized by the standard deviation of the product to ensure comparability across dimensions."""
 for j in range(args.pca_dims):
     products = pca_features[idx1_train, j] * pca_features[idx2_train, j]
     prod_demean = products - products.mean()
@@ -120,6 +151,8 @@ for j in range(args.pca_dims):
     if prod_std > 0:
         scores[j] = (prod_demean * corr_train_demean).mean() / (prod_std * corr_train_std)
 
+"""The PCA dimensions are ranked based on their scores, and the top-k dimensions with positive scores are selected.
+ If no dimensions have positive scores, the script exits with an error message."""
 n_positive = (scores > 0).sum()
 
 ranked = np.argsort(scores)[::-1]
@@ -132,10 +165,15 @@ if n_selected == 0:
     print("ERROR: No PCA dimensions scored positively. Exiting.")
     exit(1)
 
+"""The selected PCA features are extracted and weighted by their corresponding scores.
+ This creates a new feature representation that emphasizes the dimensions most correlated with the target correlation values in the training set."""
 selected_pca = pca_features[:, selected].copy()
 weights = scores[selected].astype(np.float32)
 selected_pca *= weights[np.newaxis, :]
 
+"""The script then computes the similarity scores for all pairs in the merged dataset using the selected PCA features.
+ It processes the pairs in batches to manage memory usage, 
+ calculating the dot product of the selected PCA features for the two companies in each pair."""
 idx1 = pairs_merged["idx1"].values
 idx2 = pairs_merged["idx2"].values
 correlations = pairs_merged["correlation"].values.astype(np.float32)
@@ -147,8 +185,14 @@ for s in range(0, len(pairs_merged), batch):
     i1, i2 = idx1[s:e], idx2[s:e]
     sims[s:e] = (selected_pca[i1] * selected_pca[i2]).sum(1)
 
+"""The Spearman correlation between the computed similarity scores and the actual correlation values is calculated for all pairs,
+ as well as separately for the test set.
+ This provides a measure of how well the supervised PCA method captures the relationships between the companies as reflected in the correlation values."""
 rho_all, pval_all = spearmanr(sims, correlations)
 
+"""The test set is defined based on the years specified in the test_years set.
+ The similarity scores and correlation values for the test set are extracted, 
+ and the Spearman correlation is computed for the test set to evaluate the performance of the supervised PCA method on unseen data."""
 test_mask_eval = pairs_merged["year"].isin(test_years).values
 test_sims = sims[test_mask_eval]
 test_corrs = correlations[test_mask_eval]
@@ -156,6 +200,8 @@ test_sorted = np.argsort(test_sims)[::-1]
 
 rho_test, pval_test = spearmanr(test_sims, test_corrs)
 
+"""The script then computes the cosine similarity using the original PCA features (without supervised selection) for all pairs.
+ The norms of the PCA features are calculated to facilitate the cosine similarity computation, and the Spearman correlation is computed for both the entire dataset and the test set to compare the performance of the supervised PCA method against the original unsupervised PCA approach."""
 norms_pca = np.linalg.norm(pca_features, axis=1).clip(min=1e-10)
 
 cos_unsup = np.empty(len(pairs_merged), dtype=np.float32)
@@ -174,6 +220,8 @@ all_sorted_sup = np.argsort(sims)[::-1]
 
 all_sorted_unsup = np.argsort(cos_unsup)[::-1]
 
+
+"""results table set up"""
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
