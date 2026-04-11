@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""
-Ablation: supervised feature selection on PCA dimensions.
-Isolates whether gains come from the SAE representation or the selection method.
-
-Procedure:
-  1. Load raw 131K SAE features
-  2. Fit PCA to 4000 dims (matching parent paper)
-  3. Score each PCA dim by Pearson corr of products with return correlations
-  4. Select top-k, weight by score, compute dot product similarity
-  5. Evaluate (Spearman rho + lift at top percentiles)
-
-Usage (Colab):
-    !python ablation_pca_supervised.py \
-        --features-pkl /content/drive/MyDrive/company_similarity_sae/data/llama_features.pkl \
-        --top-k 1250 \
-        --pca-dims 4000
-
-Requires: ~20 GB RAM (Colab Pro High RAM recommended)
-"""
 
 import argparse
 import numpy as np
@@ -71,7 +52,6 @@ def _parse_lifts(csv_str):
 sae_lifts_oos = _parse_lifts(args.sae_lifts_oos)
 sae_lifts_all = _parse_lifts(args.sae_lifts_all)
 
-# ---- Load features ----
 df_f = pd.read_pickle(args.features_pkl)
 df_f["features"] = df_f["features"].apply(unwrap_feature)
 df_f["__index_level_0__"] = df_f["__index_level_0__"].astype(str)
@@ -91,26 +71,22 @@ if nan_mask.sum() > 0:
     df = df[~nan_mask].reset_index(drop=True)
     feat_matrix = feat_matrix[~nan_mask]
 
-# ---- Fit PCA (globally, matching parent paper) ----
 pca = PCA(n_components=args.pca_dims, svd_solver="randomized", random_state=42)
 pca_features = pca.fit_transform(feat_matrix).astype(np.float32)
 
 del feat_matrix; gc.collect()
 
-# ---- Load pairs ----
 pairs_df = load_dataset(args.original_pairs_ds)["train"].to_pandas()
 pairs_df = pairs_df.dropna(subset=["correlation"])
 pairs_df["year"] = pairs_df["year"].astype(int)
 pairs_df["Company1"] = pairs_df["Company1"].astype(str)
 pairs_df["Company2"] = pairs_df["Company2"].astype(str)
 
-# ---- Temporal split ----
 all_years = sorted(pairs_df["year"].unique())
 split_idx = int(0.75 * len(all_years))
 train_years = set(all_years[:split_idx])
 test_years = set(all_years[split_idx:])
 
-# ---- Map companies to row indices ----
 company_ids = df["__index_level_0__"].values
 feat_idx_df = pd.DataFrame({
     "__index_level_0__": company_ids,
@@ -132,8 +108,6 @@ idx1_train = pairs_merged.loc[train_mask, "idx1"].values
 idx2_train = pairs_merged.loc[train_mask, "idx2"].values
 corr_train = pairs_merged.loc[train_mask, "correlation"].values.astype(np.float32)
 
-# ---- Score each PCA dimension ----
-# For each dim j: Pearson corr between (pca[i1,j] * pca[i2,j]) and return_corr
 scores = np.zeros(args.pca_dims, dtype=np.float64)
 
 corr_train_demean = corr_train - corr_train.mean()
@@ -148,7 +122,6 @@ for j in range(args.pca_dims):
 
 n_positive = (scores > 0).sum()
 
-# ---- Select top-k ----
 ranked = np.argsort(scores)[::-1]
 selected = ranked[:args.top_k]
 selected = selected[scores[selected] > 0]
@@ -159,7 +132,6 @@ if n_selected == 0:
     print("ERROR: No PCA dimensions scored positively. Exiting.")
     exit(1)
 
-# ---- Compute similarities (score-weighted dot product, alpha=0) ----
 selected_pca = pca_features[:, selected].copy()
 weights = scores[selected].astype(np.float32)
 selected_pca *= weights[np.newaxis, :]
@@ -175,7 +147,6 @@ for s in range(0, len(pairs_merged), batch):
     i1, i2 = idx1[s:e], idx2[s:e]
     sims[s:e] = (selected_pca[i1] * selected_pca[i2]).sum(1)
 
-# ---- Evaluate ----
 rho_all, pval_all = spearmanr(sims, correlations)
 
 test_mask_eval = pairs_merged["year"].isin(test_years).values
@@ -185,7 +156,6 @@ test_sorted = np.argsort(test_sims)[::-1]
 
 rho_test, pval_test = spearmanr(test_sims, test_corrs)
 
-# ---- Unsupervised PCA cosine (matching parent paper) ----
 norms_pca = np.linalg.norm(pca_features, axis=1).clip(min=1e-10)
 
 cos_unsup = np.empty(len(pairs_merged), dtype=np.float32)
@@ -200,18 +170,14 @@ test_cos_unsup = cos_unsup[test_mask_eval]
 test_sorted_unsup = np.argsort(test_cos_unsup)[::-1]
 rho_unsup_oos, _ = spearmanr(test_cos_unsup, test_corrs)
 
-# ---- Compute all-years lifts (supervised PCA) ----
 all_sorted_sup = np.argsort(sims)[::-1]
 
-# ---- Compute all-years lifts (unsupervised PCA) ----
 all_sorted_unsup = np.argsort(cos_unsup)[::-1]
 
-# ---- Build report tables ----
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
 def _fix_separators(table_str):
-    """Fix SEPARATING_LINE rendering in simple_outline format."""
     lines = table_str.split('\n')
     sep = None
     for line in lines:
@@ -241,8 +207,6 @@ def _bold(s):
 def _build_table(sup_rho, unsup_rho, sae_rho,
                  sup_sorted, unsup_sorted, sae_lifts_dict,
                  ref_corrs, pop_mean):
-    """Build a consolidated results table with bolded best values."""
-    # Collect all lift values per cutoff to determine maxima
     all_lifts = {}
     for pct in PCTS:
         entries = []
@@ -264,7 +228,6 @@ def _build_table(sup_rho, unsup_rho, sae_rho,
         return _bold(s) if (is_best and val is not None) else s
 
     rows = []
-    # Supervised PCA rows
     for i, pct in enumerate(PCTS):
         n_top = max(1, int(len(ref_corrs) * pct / 100.0))
         top_mean = ref_corrs[sup_sorted[:n_top]].mean()
@@ -275,7 +238,6 @@ def _build_table(sup_rho, unsup_rho, sae_rho,
             _cell(top_mean, abs(top_mean - best_lift[pct]) < 1e-8),
         ])
     rows.append(SEPARATING_LINE)
-    # SAE (new method) rows
     for i, pct in enumerate(PCTS):
         name = ["New method", "(Supervised", "selection)", "", ""][i]
         rho_cell = _cell(sae_rho, sae_rho == best_rho) if i == 0 else ""
@@ -283,7 +245,6 @@ def _build_table(sup_rho, unsup_rho, sae_rho,
         is_best = (lift_val is not None and abs(lift_val - best_lift[pct]) < 1e-8)
         rows.append([name, rho_cell, f"top {pct:.1f}%", _cell(lift_val, is_best)])
     rows.append(SEPARATING_LINE)
-    # Parent paper (unsupervised PCA) rows
     for i, pct in enumerate(PCTS):
         name = ["Parent paper", "(Unsupervised", "PCA)", "", ""][i]
         rho_cell = _cell(unsup_rho, unsup_rho == best_rho) if i == 0 else ""
@@ -292,14 +253,12 @@ def _build_table(sup_rho, unsup_rho, sae_rho,
         rows.append([name, rho_cell, f"top {pct:.1f}%",
                      _cell(top_mean, abs(top_mean - best_lift[pct]) < 1e-8)])
     rows.append(SEPARATING_LINE)
-    # Population mean
     rows.append(["Population", "", "", _fmt(pop_mean)])
     rows.append(["mean", "", "", ""])
     return _fix_separators(tabulate(rows,
                     headers=["Method", "Spearman rho", "Cutoff", "Mean correlation"],
                     tablefmt="simple_outline"))
 
-# OOS table
 oos_pop_mean = test_corrs.mean()
 print(f"\nSupervised PCA Results (OOS {min(test_years)}-{max(test_years)}, "
       f"{len(test_corrs):,d} pairs):")
@@ -310,7 +269,6 @@ print(_build_table(
     ref_corrs=test_corrs, pop_mean=oos_pop_mean,
 ))
 
-# All-years table
 all_pop_mean = correlations.mean()
 print(f"\nSupervised PCA Results (All years, {len(correlations):,d} pairs):")
 print(_build_table(
