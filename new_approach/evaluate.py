@@ -100,12 +100,13 @@ Then, for each of the top-% cutoffs specified above, it calculates the correlati
 
 cos_sims_A = ds["cosine_similarity"].values.astype(np.float32)
 corrs_A = ds["correlation"].values.astype(np.float32)
-rho_A, pval_A = spearmanr(cos_sims_A, corrs_A)
 
 test_mask_A = ds["year"].isin(test_years).values
 test_sims_A = cos_sims_A[test_mask_A]
 test_corrs_A = corrs_A[test_mask_A]
 test_sorted_A = np.argsort(test_sims_A)[::-1]
+
+rho_A, pval_A = spearmanr(test_sims_A, test_corrs_A)
 
 prec_A = {}
 for pct in PCTS:
@@ -219,12 +220,12 @@ This section uses the correlation-at-k evaluation metric (which was used for
 the parent paper in an earlier section) for our new approach. 
 """
 
-rho_B, pval_B = spearmanr(cos_sims_B, corrs_B)
-
 test_mask_B = pairs_B["year"].isin(test_years).values # This section isolates only the test years 
 test_sims_B = cos_sims_B[test_mask_B]                 # for evaluation, using the 75-25 split from before.
 test_corrs_B = corrs_B[test_mask_B]
 test_sorted_B = np.argsort(test_sims_B)[::-1] 
+
+rho_B, pval_B = spearmanr(test_sims_B, test_corrs_B)
 
 prec_B = {}
 for pct in PCTS:                                             # See the above section for more details on
@@ -306,7 +307,7 @@ for pct in PCTS:
     prec_table.append(row)
 
 print()
-print("Spearman rho (all years)")
+print("Spearman rho (OOS)")
 print(tabulate(
     spearman_table,
     headers=["Approach", "Spearman rho", "p-value"],
