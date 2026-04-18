@@ -151,14 +151,13 @@ y_pred = slope * x_range + intercept
 ax.plot(x_range, y_pred, color="red", linewidth=1.5, linestyle="--",
         label=f"OLS fit (R² = {r_squared:.3f})")
 
-ax.set_xlabel("Norm product  (||a|| · ||b||)", fontsize=12)
-ax.set_ylabel("Dot product similarity", fontsize=12)
-ax.set_title(f"Norm product vs. dot product similarity ({subset_label}, "
-             f"{n_pairs:,.0f} pairs)", fontsize=13)
+ax.set_xlabel("Norm", fontsize=12)
+ax.set_ylabel("Similarity", fontsize=12)
+ax.set_title(f"Norm vs. Similarity", fontsize=13)
 ax.legend(fontsize=10, loc="upper left")
 
 cb = fig.colorbar(hb, ax=ax)
-cb.set_label("Count (log scale)", fontsize=10)
+cb.set_label("Log count", fontsize=10)
 
 fig.tight_layout()
 out_hex = os.path.join(args.out_dir, "norm_vs_similarity_hexbin.png")
@@ -187,7 +186,7 @@ if args.scatter:
                rasterized=True)
 
     ax.plot(x_range, y_pred, color="red", linewidth=1.5, linestyle="--",
-            label=f"OLS fit (R² = {r_squared:.3f})")
+            label=f"OLS trend line, R^2 = {r_squared:.3f})")
 
     ax.set_xlabel("Norm product  (||a|| · ||b||)", fontsize=12)
     ax.set_ylabel("Dot product similarity", fontsize=12)
